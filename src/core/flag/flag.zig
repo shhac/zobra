@@ -52,6 +52,9 @@ pub const ValueType = enum {
     float64_slice, // *[]const f64 — ParseFloat
     bool_slice, // *[]const bool — ParseBool
     duration_slice, // *[]const i64 — time.ParseDuration, ns
+    string_to_string, // *std.StringHashMapUnmanaged([]const u8)
+    string_to_int, // *std.StringHashMapUnmanaged(i32)
+    string_to_int64, // *std.StringHashMapUnmanaged(i64)
 
     pub fn isBoolean(self: ValueType) bool {
         return self == .bool;
@@ -66,6 +69,10 @@ pub const ValueType = enum {
             .string_slice, .string_array, .int_slice, .int32_slice, .int64_slice, .float32_slice, .float64_slice, .bool_slice, .duration_slice => true,
             else => false,
         };
+    }
+
+    pub fn isMapLike(self: ValueType) bool {
+        return self == .string_to_string or self == .string_to_int or self == .string_to_int64;
     }
 };
 
@@ -87,9 +94,14 @@ pub const Flag = struct {
     deprecated: []const u8,
     /// Whether the FlagSet owns `default_value_string` and should free it.
     owns_default: bool,
-    /// For slice / map types: the FlagSet owns the slice/map storage that
+    /// For slice types: the FlagSet owns the slice storage that
     /// `value_ptr` points at, and frees it on deinit.
     owns_value_storage: bool,
+    /// For map types: the FlagSet owns the map ENTRIES (keys/values are
+    /// borrowed from argv; the entry slots are heap-allocated by the
+    /// HashMap and need deinit). Distinct from owns_value_storage so the
+    /// per-type free dispatch doesn't conflate the two.
+    owns_map_storage: bool = false,
 };
 
 pub const FlagSet = struct {
@@ -118,6 +130,7 @@ pub const FlagSet = struct {
         for (self.ordered.items) |flag| {
             if (flag.owns_default) self.allocator.free(flag.default_value_string);
             if (flag.owns_value_storage) freeSliceStorage(self.allocator, flag);
+            if (flag.owns_map_storage) freeMapStorage(self.allocator, flag);
             self.allocator.destroy(flag);
         }
         self.formal.deinit(self.allocator);
@@ -434,6 +447,72 @@ pub const FlagSet = struct {
         try self.registerSliceLike(i64, .duration_slice, ptr, name, shorthand, default, usage);
     }
 
+    pub fn stringToStringVarP(
+        self: *FlagSet,
+        ptr: *std.StringHashMapUnmanaged([]const u8),
+        name: []const u8,
+        shorthand: u8,
+        usage: []const u8,
+    ) !void {
+        try self.registerMapLike(.string_to_string, @ptrCast(ptr), name, shorthand, usage);
+    }
+
+    pub fn stringToIntVarP(
+        self: *FlagSet,
+        ptr: *std.StringHashMapUnmanaged(i32),
+        name: []const u8,
+        shorthand: u8,
+        usage: []const u8,
+    ) !void {
+        try self.registerMapLike(.string_to_int, @ptrCast(ptr), name, shorthand, usage);
+    }
+
+    pub fn stringToInt64VarP(
+        self: *FlagSet,
+        ptr: *std.StringHashMapUnmanaged(i64),
+        name: []const u8,
+        shorthand: u8,
+        usage: []const u8,
+    ) !void {
+        try self.registerMapLike(.string_to_int64, @ptrCast(ptr), name, shorthand, usage);
+    }
+
+    fn registerMapLike(
+        self: *FlagSet,
+        comptime tag: ValueType,
+        ptr: *anyopaque,
+        name: []const u8,
+        shorthand: u8,
+        usage: []const u8,
+    ) !void {
+        // Maps default-render as "[]" per pflag (GetStringToString returns
+        // an empty map, and the "default …" suffix is suppressed).
+        const ds = try self.allocator.dupe(u8, "[]");
+        errdefer self.allocator.free(ds);
+
+        _ = try self.addFlag(.{
+            .name = name,
+            .shorthand = shorthand,
+            .usage = usage,
+            .value_type = tag,
+            .value_ptr = ptr,
+            .default_value_string = ds,
+            .owns_default = true,
+            // Maps don't allocate their backbone in `addFlag` — the user
+            // supplied a pre-existing empty `StringHashMapUnmanaged`.
+            // `owns_value_storage` controls slice-storage freeing only;
+            // map entries are freed in `freeMapStorage` below via
+            // `owns_map_storage`.
+            .owns_value_storage = false,
+            .no_opt_def_val = "",
+        });
+        // Mark the flag as owning its map storage. Maps are tracked via
+        // a separate flag because the slice path uses owns_value_storage
+        // and we don't want the slice-free dispatch firing for maps.
+        const flag = self.lookup(name).?;
+        flag.owns_map_storage = true;
+    }
+
     fn registerSliceLike(
         self: *FlagSet,
         comptime Elem: type,
@@ -744,7 +823,69 @@ fn setStored(
         .float64_slice => bindNumericSlice(allocator, f64, flag, value, diag, .float, "ParseFloat"),
         .bool_slice => bindBoolSlice(allocator, flag, value, diag),
         .duration_slice => bindDurationSlice(allocator, flag, value, diag),
+        .string_to_string => bindStringToString(allocator, flag, value, diag),
+        .string_to_int => bindStringToInt(allocator, i32, flag, value, diag, "ParseInt"),
+        .string_to_int64 => bindStringToInt(allocator, i64, flag, value, diag, "ParseInt"),
     };
+}
+
+fn bindStringToString(
+    allocator: std.mem.Allocator,
+    flag: *Flag,
+    value: []const u8,
+    diag: ?*Diagnostic,
+) (errors.FlagError || std.mem.Allocator.Error)!void {
+    _ = diag;
+    const map: *std.StringHashMapUnmanaged([]const u8) = @ptrCast(@alignCast(flag.value_ptr));
+    var it = std.mem.splitScalar(u8, value, ',');
+    while (it.next()) |item| {
+        const eq = std.mem.indexOfScalar(u8, item, '=') orelse {
+            // pflag's quirky leading-space wording when an item has no '='.
+            return error.TypeCoercionFailed;
+        };
+        try map.put(allocator, item[0..eq], item[eq + 1 ..]);
+    }
+}
+
+fn bindStringToInt(
+    allocator: std.mem.Allocator,
+    comptime T: type,
+    flag: *Flag,
+    value: []const u8,
+    diag: ?*Diagnostic,
+    comptime func_name: []const u8,
+) (errors.FlagError || std.mem.Allocator.Error)!void {
+    const map: *std.StringHashMapUnmanaged(T) = @ptrCast(@alignCast(flag.value_ptr));
+    var it = std.mem.splitScalar(u8, value, ',');
+    while (it.next()) |item| {
+        const eq = std.mem.indexOfScalar(u8, item, '=') orelse {
+            return error.TypeCoercionFailed;
+        };
+        const key = item[0..eq];
+        const raw_val = item[eq + 1 ..];
+        const n = coerce.parseSignedInt(T, raw_val) catch |err| {
+            return failCoerce(allocator, flag, raw_val, diag, func_name, coerce.intCause(err));
+        };
+        try map.put(allocator, key, n);
+    }
+}
+
+fn freeMapStorage(allocator: std.mem.Allocator, flag: *Flag) void {
+    switch (flag.value_type) {
+        .string_to_string => {
+            const m: *std.StringHashMapUnmanaged([]const u8) = @ptrCast(@alignCast(flag.value_ptr));
+            m.deinit(allocator);
+        },
+        .string_to_int => {
+            const m: *std.StringHashMapUnmanaged(i32) = @ptrCast(@alignCast(flag.value_ptr));
+            m.deinit(allocator);
+        },
+        .string_to_int64 => {
+            const m: *std.StringHashMapUnmanaged(i64) = @ptrCast(@alignCast(flag.value_ptr));
+            m.deinit(allocator);
+        },
+        else => {},
+    }
 }
 
 const SliceParseKind = enum { signed, float };

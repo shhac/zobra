@@ -197,6 +197,9 @@ pub fn typeDisplayName(t: ValueType) []const u8 {
         .float64_slice => "float64Slice",
         .bool_slice => "bools",
         .duration_slice => "durationSlice",
+        .string_to_string => "stringToString",
+        .string_to_int => "stringToInt",
+        .string_to_int64 => "stringToInt64",
     };
 }
 
@@ -207,7 +210,7 @@ pub fn defaultIsZeroValue(flag: *const Flag) bool {
         .duration => std.mem.eql(u8, flag.default_value_string, "0") or std.mem.eql(u8, flag.default_value_string, "0s"),
         .int, .int8, .int16, .int32, .int64, .uint, .uint8, .uint16, .uint32, .uint64, .count, .float32, .float64 => std.mem.eql(u8, flag.default_value_string, "0"),
         .string => flag.default_value_string.len == 0,
-        .string_slice, .string_array, .int_slice, .int32_slice, .int64_slice, .float32_slice, .float64_slice, .bool_slice, .duration_slice => std.mem.eql(u8, flag.default_value_string, "[]"),
+        .string_slice, .string_array, .int_slice, .int32_slice, .int64_slice, .float32_slice, .float64_slice, .bool_slice, .duration_slice, .string_to_string, .string_to_int, .string_to_int64 => std.mem.eql(u8, flag.default_value_string, "[]"),
     };
 }
 

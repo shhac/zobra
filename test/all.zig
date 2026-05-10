@@ -10,6 +10,7 @@ test {
     _ = @import("command/multi_level.zig");
     _ = @import("flag/flagset.zig");
     _ = @import("flag/slice_types.zig");
+    _ = @import("flag/map_types.zig");
     _ = @import("coverage/oom.zig");
     _ = @import("coverage/wording.zig");
     _ = @import("coverage/duration_boundary.zig");
