@@ -480,6 +480,18 @@ fn findCharSlice(raw: []const u8, c: u8) []const u8 {
     return raw[idx .. idx + 1];
 }
 
+/// Public re-export so other modules (specifically command.zig, which has
+/// its own apply loop with the Command-tree effective lookup) can store
+/// values without duplicating the dispatch table.
+pub fn setStoredExternal(
+    allocator: std.mem.Allocator,
+    flag: *Flag,
+    value: []const u8,
+    diag: ?*Diagnostic,
+) errors.FlagError!void {
+    return setStored(allocator, flag, value, diag);
+}
+
 /// Coerce `value` according to `flag.value_type` and write through
 /// `flag.value_ptr`. On failure, fills diag with the strconv-style cause
 /// and the flag context.

@@ -33,6 +33,11 @@ pub const flag = struct {
 
 pub const FlagSet = flag.FlagSet;
 
+const command_mod = @import("core/command/command.zig");
+pub const Command = command_mod.Command;
+pub const args = @import("core/command/args.zig");
+pub const ArgsValidator = args.ArgsValidator;
+
 /// Writes a placeholder banner to the given writer. Goes away once the
 /// example exe has something more meaningful to show (Phase 3).
 pub fn hello(writer: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -50,6 +55,9 @@ test {
     _ = @import("core/flag/coerce.zig");
     _ = @import("core/flag/duration.zig");
     _ = @import("core/flag/flag.zig");
+    _ = @import("core/command/args.zig");
+    _ = @import("core/command/command.zig");
+    _ = @import("core/command/hook.zig");
 }
 
 test "version is non-empty" {

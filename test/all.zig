@@ -6,6 +6,7 @@ const zobra = @import("zobra");
 
 test {
     _ = @import("parser/mixed.zig");
+    _ = @import("command/multi_level.zig");
 }
 
 test "scaffold: zobra module imports cleanly" {
