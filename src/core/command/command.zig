@@ -21,6 +21,8 @@ const hook_mod = @import("hook.zig");
 const suggest_mod = @import("suggest.zig");
 const groups_mod = @import("groups.zig");
 const defaults_mod = @import("defaults.zig");
+const argv_mod = @import("argv.zig");
+const parse_diag = @import("parse_diag.zig");
 const help_mod = @import("../help/help.zig");
 
 pub const FlagSet = flag_mod.FlagSet;
@@ -456,7 +458,7 @@ pub const Command = struct {
         const tokens = try parser_mod.parse(allocator, argv, cmd.effectiveFlagSchema(), diag);
         defer allocator.free(tokens);
 
-        const pi = firstPositionalArgvIndex(tokens, argv) orelse {
+        const pi = argv_mod.firstPositionalArgvIndex(tokens, argv) orelse {
             const dup = try allocator.dupe([]const u8, argv);
             return .{ .cmd = cmd, .remaining = dup };
         };
@@ -467,7 +469,7 @@ pub const Command = struct {
             return .{ .cmd = cmd, .remaining = dup };
         };
 
-        const stripped = try argvWithout(allocator, argv, pi);
+        const stripped = try argv_mod.argvWithout(allocator, argv, pi);
         defer allocator.free(stripped);
         return findRec(child, allocator, stripped, diag);
     }
@@ -593,7 +595,7 @@ pub const Command = struct {
         try defaults_mod.initHelpCommand(self);
 
         const found = self.findCommand(allocator, argv, diag) catch |err| {
-            if (diag) |d| try renderParseDiag(allocator, d);
+            if (diag) |d| try parse_diag.render(allocator, d);
             return err;
         };
         defer allocator.free(found.remaining);
@@ -633,7 +635,7 @@ pub const Command = struct {
     fn parseAndApply(self: *Command, sub_argv: []const []const u8, diag: ?*Diagnostic) !void {
         const allocator = self.allocator;
         const tokens = parser_mod.parse(allocator, sub_argv, self.effectiveFlagSchema(), diag) catch |err| {
-            if (diag) |d| try renderParseDiag(allocator, d);
+            if (diag) |d| try parse_diag.render(allocator, d);
             return err;
         };
         defer allocator.free(tokens);
@@ -641,19 +643,19 @@ pub const Command = struct {
         self.applyTokens(tokens, diag) catch |err| switch (err) {
             error.UnknownFlag => {
                 if (self.allow_unknown_flags) {
-                    swallowParseDiag(diag);
+                    parse_diag.swallow(diag);
                 } else {
                     if (!self.disable_suggestions) {
                         if (diag) |d| if (d.flag_name) |name| {
                             try self.attachFlagSuggestion(d, name);
                         };
                     }
-                    if (diag) |d| try renderParseDiag(allocator, d);
+                    if (diag) |d| try parse_diag.render(allocator, d);
                     return err;
                 }
             },
             error.MissingValue, error.BadFlagSyntax => {
-                if (diag) |d| try renderParseDiag(allocator, d);
+                if (diag) |d| try parse_diag.render(allocator, d);
                 return err;
             },
             else => return err,
@@ -813,192 +815,4 @@ fn walkFlagsForSuggestion(
             }
         }
     }
-}
-
-/// Return the argv index of the first positional token in `tokens`.
-/// Returns null when the token stream has no positional before the
-/// first terminator/passthrough (which happens when argv is all flags
-/// or the user invoked `--` early). Pure function — testable in
-/// isolation against a hand-built token stream.
-///
-/// Note: this is *not* the same as the position of the first positional
-/// token in the token slice. Long/short tokens with a separate-argv
-/// value consume two argv slots, so the mapping from token-index to
-/// argv-index isn't 1:1. The byte-pointer aliasing in `argvUsedByToken`
-/// reconstructs it.
-pub fn firstPositionalArgvIndex(tokens: []const Token, argv: []const []const u8) ?usize {
-    var pi: usize = 0;
-    for (tokens) |t| switch (t) {
-        .positional => return pi,
-        .terminator, .passthrough => return null,
-        .long, .short, .negated => {
-            pi += argvUsedByToken(t, argv, pi);
-            if (pi > argv.len) return null;
-        },
-    };
-    return null;
-}
-
-/// argv slots consumed by a single token at `pi`. Long/short with a
-/// SEPARATE-argv value consume 2 (e.g. `--name alice` is two argv
-/// slots); attached values (`--name=alice`, `-nalice`) and value-less
-/// boolean/count tokens consume 1.
-fn argvUsedByToken(t: Token, argv: []const []const u8, pi: usize) usize {
-    switch (t) {
-        .long => |l| {
-            if (l.value) |v| {
-                if (pi + 1 < argv.len and slicesAlias(v, argv[pi + 1])) return 2;
-            }
-            return 1;
-        },
-        .short => |s| {
-            if (s.value) |v| {
-                if (pi + 1 < argv.len and slicesAlias(v, argv[pi + 1])) return 2;
-            }
-            return 1;
-        },
-        .negated, .positional, .terminator, .passthrough => return 1,
-    }
-}
-
-/// True iff slice `a` is a sub-range of slice `b` by byte address.
-/// Used to detect "did this token's value come from the next argv
-/// element?" — if v aliases argv[pi+1], the parser consumed it.
-fn slicesAlias(a: []const u8, b: []const u8) bool {
-    if (a.len == 0 or b.len == 0) return false;
-    const a_start = @intFromPtr(a.ptr);
-    const b_start = @intFromPtr(b.ptr);
-    const b_end = b_start + b.len;
-    return a_start >= b_start and a_start < b_end;
-}
-
-/// Allocate a fresh argv slice equal to `argv` minus the element at
-/// `idx`. Caller frees with the same allocator.
-fn argvWithout(allocator: Allocator, argv: []const []const u8, idx: usize) ![]const []const u8 {
-    std.debug.assert(idx < argv.len);
-    const out = try allocator.alloc([]const u8, argv.len - 1);
-    var j: usize = 0;
-    for (argv, 0..) |a, i| {
-        if (i == idx) continue;
-        out[j] = a;
-        j += 1;
-    }
-    return out;
-}
-
-/// Reset the parse-layer fields on a Diagnostic. Used by
-/// `allow_unknown_flags`: the apply layer filled the diagnostic before
-/// raising UnknownFlag; the swallow path needs to clear it so a
-/// downstream check (validateRequiredFlags, etc.) doesn't see stale
-/// state.
-fn swallowParseDiag(diag: ?*Diagnostic) void {
-    if (diag) |d| {
-        d.category = null;
-        d.code = null;
-        d.flag_name = null;
-        d.raw = null;
-        d.short_group = null;
-    }
-}
-
-/// Render pflag-byte-identical wording for parse-layer errors. The
-/// design (07-error-model.md) puts this in command.zig deliberately —
-/// the parser/flag layers stay layering-clean and write only the
-/// structured fields (flag_name, raw, code) to the diagnostic; this
-/// helper composes the human-readable rendering on the way out.
-///
-/// Wordings (matching pflag):
-///   unknown flag: --foo
-///   unknown shorthand flag: "X" in -group
-///   flag needs an argument: --foo
-///   flag needs an argument: "X" in -group
-///   bad flag syntax: <full argv element>
-fn renderParseDiag(allocator: Allocator, diag: *Diagnostic) !void {
-    if (diag.message != null) return;
-    const code = diag.code orelse return;
-    const rendered: []u8 = switch (code) {
-        .unknown_flag => blk: {
-            if (diag.short_group) |group| {
-                const name = diag.flag_name orelse return;
-                break :blk try std.fmt.allocPrint(
-                    allocator,
-                    "unknown shorthand flag: \"{s}\" in -{s}",
-                    .{ name, group },
-                );
-            }
-            const name = diag.flag_name orelse return;
-            break :blk try std.fmt.allocPrint(allocator, "unknown flag: --{s}", .{name});
-        },
-        .missing_value => blk: {
-            if (diag.short_group) |group| {
-                const name = diag.flag_name orelse return;
-                break :blk try std.fmt.allocPrint(
-                    allocator,
-                    "flag needs an argument: \"{s}\" in -{s}",
-                    .{ name, group },
-                );
-            }
-            const name = diag.flag_name orelse return;
-            break :blk try std.fmt.allocPrint(allocator, "flag needs an argument: --{s}", .{name});
-        },
-        .bad_flag_syntax => blk: {
-            const raw = diag.raw orelse return;
-            break :blk try std.fmt.allocPrint(allocator, "bad flag syntax: {s}", .{raw});
-        },
-        else => return,
-    };
-    diag.setOwnedMessage(allocator, rendered);
-}
-
-// Most Command tests live in test/command/command.zig (file-decomposition
-// pass). Inline below: pure-function tests for `firstPositionalArgvIndex`
-// and `argvWithout` — both internal, no public-API surface.
-
-const testing = std.testing;
-
-test "firstPositionalArgvIndex: empty argv returns null" {
-    const tokens: []const Token = &.{};
-    try testing.expect(firstPositionalArgvIndex(tokens, &.{}) == null);
-}
-
-test "firstPositionalArgvIndex: leading positional" {
-    const tokens: []const Token = &.{.{ .positional = .{ .value = "x" } }};
-    try testing.expectEqual(@as(?usize, 0), firstPositionalArgvIndex(tokens, &.{"x"}));
-}
-
-test "firstPositionalArgvIndex: long with attached value, then positional" {
-    const argv: []const []const u8 = &.{ "--name=alice", "greet" };
-    const tokens: []const Token = &.{
-        .{ .long = .{ .name = "name", .value = argv[0][7..], .raw = argv[0] } },
-        .{ .positional = .{ .value = argv[1] } },
-    };
-    try testing.expectEqual(@as(?usize, 1), firstPositionalArgvIndex(tokens, argv));
-}
-
-test "firstPositionalArgvIndex: long with separate-argv value consumes 2 slots" {
-    const argv: []const []const u8 = &.{ "--name", "alice", "greet" };
-    const tokens: []const Token = &.{
-        .{ .long = .{ .name = "name", .value = argv[1], .raw = argv[0] } },
-        .{ .positional = .{ .value = argv[2] } },
-    };
-    try testing.expectEqual(@as(?usize, 2), firstPositionalArgvIndex(tokens, argv));
-}
-
-test "firstPositionalArgvIndex: terminator stops the search" {
-    const argv: []const []const u8 = &.{ "--", "x" };
-    const tokens: []const Token = &.{
-        .terminator,
-        .{ .passthrough = "x" },
-    };
-    try testing.expect(firstPositionalArgvIndex(tokens, argv) == null);
-}
-
-test "argvWithout: drops the indexed element" {
-    const gpa = testing.allocator;
-    const argv: []const []const u8 = &.{ "a", "b", "c" };
-    const out = try argvWithout(gpa, argv, 1);
-    defer gpa.free(out);
-    try testing.expectEqual(@as(usize, 2), out.len);
-    try testing.expectEqualStrings("a", out[0]);
-    try testing.expectEqualStrings("c", out[1]);
 }

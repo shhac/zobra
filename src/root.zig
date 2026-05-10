@@ -69,11 +69,14 @@ test {
     _ = @import("core/flag/flag.zig");
     _ = @import("core/flag/bind.zig");
     _ = @import("core/command/args.zig");
+    _ = @import("core/command/argv.zig");
     _ = @import("core/command/command.zig");
     _ = @import("core/command/defaults.zig");
     _ = @import("core/command/groups.zig");
     _ = @import("core/command/hook.zig");
+    _ = @import("core/command/parse_diag.zig");
     _ = @import("core/command/suggest.zig");
+    _ = @import("core/flag/apply.zig");
     _ = @import("core/help/usage.zig");
     _ = @import("core/help/help.zig");
 }

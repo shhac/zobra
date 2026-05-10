@@ -100,7 +100,7 @@ fn parseGoStyleInt(comptime T: type, s: []const u8, sign: Sign) !T {
         }
     }
 
-    return mapIntError(std.fmt.parseInt(T, s, 0));
+    return std.fmt.parseInt(T, s, 0);
 }
 
 fn parseWithExplicitBase(comptime T: type, sign_slice: []const u8, body: []const u8, base: u8) !T {
@@ -115,9 +115,9 @@ fn parseWithExplicitBase(comptime T: type, sign_slice: []const u8, body: []const
         if (sign_slice.len + body.len > buf.len) return error.InvalidSyntax;
         std.mem.copyForwards(u8, buf[0..sign_slice.len], sign_slice);
         std.mem.copyForwards(u8, buf[sign_slice.len..][0..body.len], body);
-        return mapIntError(std.fmt.parseInt(T, buf[0 .. sign_slice.len + body.len], base));
+        return std.fmt.parseInt(T, buf[0 .. sign_slice.len + body.len], base);
     }
-    return mapIntError(std.fmt.parseInt(T, body, base));
+    return std.fmt.parseInt(T, body, base);
 }
 
 fn isOctalDigit(c: u8) bool {
@@ -132,12 +132,6 @@ fn isDigitForBase(c: u8, base: u8) bool {
         16 => (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F'),
         else => false,
     };
-}
-
-fn mapIntError(r: anytype) @TypeOf(r) {
-    // Pass-through; the caller switches on error.InvalidCharacter / Overflow
-    // and translates into our Cause enum at the Set boundary.
-    return r;
 }
 
 /// Translate a Zig parseInt error to our Cause.

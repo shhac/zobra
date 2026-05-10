@@ -102,17 +102,16 @@ fn bindIpMask(
     value: []const u8,
     diag: ?*Diagnostic,
 ) (errors.FlagError || std.mem.Allocator.Error)!void {
-    const valid_len = value.len == 8 or value.len == 32;
-    var all_hex = true;
+    // pflag accepts hex (8 chars for IPv4 mask, 32 for IPv6) or
+    // dotted-decimal. Minimum validation: 8 or 32 hex chars.
+    if (value.len != 8 and value.len != 32) {
+        return failCoerceFmt(allocator, flag, value, diag, "invalid IP mask: {s}", .{value});
+    }
     for (value) |c| {
         const is_hex = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
         if (!is_hex) {
-            all_hex = false;
-            break;
+            return failCoerceFmt(allocator, flag, value, diag, "invalid IP mask: {s}", .{value});
         }
-    }
-    if (!(valid_len and all_hex)) {
-        return failCoerceFmt(allocator, flag, value, diag, "invalid IP mask: {s}", .{value});
     }
     const p: *[]const u8 = @ptrCast(@alignCast(flag.value_ptr));
     p.* = value;
