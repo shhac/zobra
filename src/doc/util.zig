@@ -75,12 +75,201 @@ pub fn useLine(allocator: std.mem.Allocator, cmd: *const Command) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ path, args_part, flags_suffix });
 }
 
+/// Replace every occurrence of `' '` in `s` with `repl`. Caller frees.
+/// Generalisation of `underscoreSpaces` — kept separate so the common
+/// underscore-replacement call sites stay terse.
+pub fn replaceSpaces(allocator: std.mem.Allocator, s: []const u8, repl: u8) ![]u8 {
+    const out = try allocator.dupe(u8, s);
+    for (out) |*c| if (c.* == ' ') {
+        c.* = repl;
+    };
+    return out;
+}
+
+/// Collect every non-hidden flag across the supplied flag sets and
+/// return them sorted by name. Caller frees the returned slice.
+pub fn collectVisibleSortedFlags(
+    allocator: std.mem.Allocator,
+    sets: []const *const zobra.flag.FlagSet,
+) ![]const *const zobra.flag.Flag {
+    var list: std.ArrayListUnmanaged(*const zobra.flag.Flag) = .empty;
+    defer list.deinit(allocator);
+    for (sets) |fs| {
+        for (fs.ordered.items) |f| {
+            if (f.hidden) continue;
+            try list.append(allocator, f);
+        }
+    }
+    const out = try list.toOwnedSlice(allocator);
+    std.mem.sort(*const zobra.flag.Flag, out, {}, struct {
+        fn lt(_: void, a: *const zobra.flag.Flag, b: *const zobra.flag.Flag) bool {
+            return std.mem.lessThan(u8, a.name, b.name);
+        }
+    }.lt);
+    return out;
+}
+
+/// Walk up `cmd.parent` chain, collecting each ancestor's persistent
+/// flag set. Returns ancestors in walk-order (deepest first). Caller
+/// frees. Used by every doc generator's "Options inherited from
+/// parent commands" section.
+pub fn collectInheritedPersistentSets(
+    allocator: std.mem.Allocator,
+    cmd: *const Command,
+) ![]const *const zobra.flag.FlagSet {
+    var list: std.ArrayListUnmanaged(*const zobra.flag.FlagSet) = .empty;
+    defer list.deinit(allocator);
+    var p = cmd.parent;
+    while (p) |parent| : (p = parent.parent) {
+        try list.append(allocator, &parent.persistent_flags_set);
+    }
+    return try list.toOwnedSlice(allocator);
+}
+
+/// Sort `cmd.children` by name and filter to those that should appear
+/// in doc output (available + not a help-topic-only command). Caller
+/// frees.
+pub fn docEligibleChildren(allocator: std.mem.Allocator, cmd: *const Command) ![]const *Command {
+    const sorted = try sortedChildren(allocator, cmd);
+    defer allocator.free(sorted);
+    var list: std.ArrayListUnmanaged(*Command) = .empty;
+    defer list.deinit(allocator);
+    for (sorted) |c| {
+        if (!isAvailableCommand(c)) continue;
+        if (isAdditionalHelpTopicCommand(c)) continue;
+        try list.append(allocator, c);
+    }
+    return try list.toOwnedSlice(allocator);
+}
+
+/// Open `<dir>/<basename><ext>` for write, hand a buffered `*std.Io.Writer`
+/// to `gen_fn`, then flush. Centralises the boilerplate that lived
+/// verbatim in each `genXxxTree` function. Caller supplies the
+/// per-format extension (including the leading `.`).
+pub fn writeToFile(
+    allocator: std.mem.Allocator,
+    dir: []const u8,
+    basename: []const u8,
+    ext: []const u8,
+    cmd: *const Command,
+    gen_fn: *const fn (std.mem.Allocator, *const Command, *std.Io.Writer) anyerror!void,
+) !void {
+    const filename = try std.fmt.allocPrint(allocator, "{s}{s}", .{ basename, ext });
+    defer allocator.free(filename);
+    const full_path = try std.fs.path.join(allocator, &.{ dir, filename });
+    defer allocator.free(full_path);
+
+    const file = try std.fs.cwd().createFile(full_path, .{});
+    defer file.close();
+    var buf: [4096]u8 = undefined;
+    var fw = file.writer(&buf);
+    try gen_fn(allocator, cmd, &fw.interface);
+    try fw.interface.flush();
+}
+
 const testing = std.testing;
 
 test "underscoreSpaces: replaces every space" {
     const out = try underscoreSpaces(testing.allocator, "a b c d");
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("a_b_c_d", out);
+}
+
+test "replaceSpaces: replaces with arbitrary char" {
+    const out = try replaceSpaces(testing.allocator, "a b c", '-');
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("a-b-c", out);
+}
+
+test "useLine: bare command → just path" {
+    const gpa = testing.allocator;
+    const root = try Command.init(gpa, .{ .use = "tool", .run_e = noopRun });
+    defer root.deinit();
+    const out = try useLine(gpa, root);
+    defer gpa.free(out);
+    try testing.expectEqualStrings("tool", out);
+}
+
+test "useLine: with args part" {
+    const gpa = testing.allocator;
+    const root = try Command.init(gpa, .{ .use = "tool [target]", .run_e = noopRun });
+    defer root.deinit();
+    const out = try useLine(gpa, root);
+    defer gpa.free(out);
+    try testing.expectEqualStrings("tool [target]", out);
+}
+
+test "useLine: with local flags appended" {
+    const gpa = testing.allocator;
+    const root = try Command.init(gpa, .{ .use = "tool", .run_e = noopRun });
+    defer root.deinit();
+    var v: bool = false;
+    try root.flags().boolVarP(&v, "verbose", 'v', false, "v");
+    const out = try useLine(gpa, root);
+    defer gpa.free(out);
+    try testing.expectEqualStrings("tool [flags]", out);
+}
+
+test "useLine: with both args and flags" {
+    const gpa = testing.allocator;
+    const root = try Command.init(gpa, .{ .use = "tool [target]", .run_e = noopRun });
+    defer root.deinit();
+    var v: bool = false;
+    try root.flags().boolVarP(&v, "verbose", 'v', false, "v");
+    const out = try useLine(gpa, root);
+    defer gpa.free(out);
+    try testing.expectEqualStrings("tool [target] [flags]", out);
+}
+
+test "collectVisibleSortedFlags: sorts and filters hidden" {
+    const gpa = testing.allocator;
+    var fs = zobra.flag.FlagSet.init(gpa);
+    defer fs.deinit();
+    var a: bool = false;
+    var b: bool = false;
+    var c: bool = false;
+    try fs.boolVarP(&b, "bravo", 0, false, "b");
+    try fs.boolVarP(&a, "alpha", 0, false, "a");
+    try fs.boolVarP(&c, "charlie", 0, false, "c");
+    fs.lookup("charlie").?.hidden = true;
+    const out = try collectVisibleSortedFlags(gpa, &.{&fs});
+    defer gpa.free(out);
+    try testing.expectEqual(@as(usize, 2), out.len);
+    try testing.expectEqualStrings("alpha", out[0].name);
+    try testing.expectEqualStrings("bravo", out[1].name);
+}
+
+test "collectInheritedPersistentSets: walks parent chain in deepest-first order" {
+    const gpa = testing.allocator;
+    const root = try Command.init(gpa, .{ .use = "root" });
+    defer root.deinit();
+    const mid = try Command.init(gpa, .{ .use = "mid" });
+    try root.addCommand(mid);
+    const leaf = try Command.init(gpa, .{ .use = "leaf", .run_e = noopRun });
+    try mid.addCommand(leaf);
+
+    const out = try collectInheritedPersistentSets(gpa, leaf);
+    defer gpa.free(out);
+    try testing.expectEqual(@as(usize, 2), out.len);
+    try testing.expect(out[0] == &mid.persistent_flags_set);
+    try testing.expect(out[1] == &root.persistent_flags_set);
+}
+
+test "docEligibleChildren: sorts and filters hidden + help-topic-only" {
+    const gpa = testing.allocator;
+    const root = try Command.init(gpa, .{ .use = "root" });
+    defer root.deinit();
+    try root.addCommand(try Command.init(gpa, .{ .use = "bravo", .run_e = noopRun }));
+    try root.addCommand(try Command.init(gpa, .{ .use = "alpha", .run_e = noopRun }));
+    try root.addCommand(try Command.init(gpa, .{ .use = "hidden_one", .hidden = true, .run_e = noopRun }));
+    // help-topic-only: no run + no runnable children
+    try root.addCommand(try Command.init(gpa, .{ .use = "help_topic" }));
+
+    const out = try docEligibleChildren(gpa, root);
+    defer gpa.free(out);
+    try testing.expectEqual(@as(usize, 2), out.len);
+    try testing.expectEqualStrings("alpha", out[0].commandName());
+    try testing.expectEqualStrings("bravo", out[1].commandName());
 }
 
 test "hasSeeAlso: parent → true" {

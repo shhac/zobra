@@ -32,7 +32,7 @@ pub fn genMan(
     defer allocator.free(path);
     const path_upper = try toUpper(allocator, path);
     defer allocator.free(path_upper);
-    const dashed_path = try replaceSpaces(allocator, path, '-');
+    const dashed_path = try util.replaceSpaces(allocator, path, '-');
     defer allocator.free(dashed_path);
 
     const title_str = if (header.title.len > 0) header.title else path_upper;
@@ -74,35 +74,31 @@ pub fn genMan(
 
     try writeManFlagsSection(allocator, w, "OPTIONS", &.{ &cmd.flags_set, &cmd.persistent_flags_set });
 
-    var inherited: std.ArrayListUnmanaged(*const zobra.FlagSet) = .empty;
-    defer inherited.deinit(allocator);
-    var p: ?*const Command = cmd.parent;
-    while (p) |up| : (p = up.parent) {
-        try inherited.append(allocator, &up.persistent_flags_set);
-    }
-    try writeManFlagsSection(allocator, w, "OPTIONS INHERITED FROM PARENT COMMANDS", inherited.items);
+    const inherited = try util.collectInheritedPersistentSets(allocator, cmd);
+    defer allocator.free(inherited);
+    try writeManFlagsSection(allocator, w, "OPTIONS INHERITED FROM PARENT COMMANDS", inherited);
 
     if (util.hasSeeAlso(cmd)) {
         try w.writeAll(".SH SEE ALSO\n");
         if (cmd.parent) |parent| {
             const pname = try parent.commandPathString(allocator);
             defer allocator.free(pname);
-            const pdash = try replaceSpaces(allocator, pname, '-');
-            defer allocator.free(pdash);
-            try w.print("\\fB{s}({s})\\fP\n", .{ pdash, header.section });
+            try writeManLink(allocator, w, pname, header.section);
         }
-        const sorted = try util.sortedChildren(allocator, cmd);
-        defer allocator.free(sorted);
-        for (sorted) |child| {
-            if (!util.isAvailableCommand(child)) continue;
-            if (util.isAdditionalHelpTopicCommand(child)) continue;
+        const children = try util.docEligibleChildren(allocator, cmd);
+        defer allocator.free(children);
+        for (children) |child| {
             const cname = try std.fmt.allocPrint(allocator, "{s} {s}", .{ path, child.commandName() });
             defer allocator.free(cname);
-            const cdash = try replaceSpaces(allocator, cname, '-');
-            defer allocator.free(cdash);
-            try w.print("\\fB{s}({s})\\fP\n", .{ cdash, header.section });
+            try writeManLink(allocator, w, cname, header.section);
         }
     }
+}
+
+fn writeManLink(allocator: std.mem.Allocator, w: *std.Io.Writer, display_path: []const u8, section: []const u8) !void {
+    const dashed = try util.replaceSpaces(allocator, display_path, '-');
+    defer allocator.free(dashed);
+    try w.print("\\fB{s}({s})\\fP\n", .{ dashed, section });
 }
 
 fn writeManFlagsSection(
@@ -111,21 +107,12 @@ fn writeManFlagsSection(
     section_title: []const u8,
     sets: []const *const zobra.FlagSet,
 ) !void {
-    var flags: std.ArrayListUnmanaged(*const zobra.flag.Flag) = .empty;
-    defer flags.deinit(allocator);
-    for (sets) |set| for (set.ordered.items) |f| {
-        if (f.hidden) continue;
-        try flags.append(allocator, f);
-    };
-    if (flags.items.len == 0) return;
-    std.mem.sort(*const zobra.flag.Flag, flags.items, {}, struct {
-        fn lt(_: void, a: *const zobra.flag.Flag, b: *const zobra.flag.Flag) bool {
-            return std.mem.lessThan(u8, a.name, b.name);
-        }
-    }.lt);
+    const flags = try util.collectVisibleSortedFlags(allocator, sets);
+    defer allocator.free(flags);
+    if (flags.len == 0) return;
 
     try w.print(".SH {s}\n", .{section_title});
-    for (flags.items) |f| {
+    for (flags) |f| {
         try w.writeAll(".PP\n");
         if (f.shorthand != 0 and f.deprecated.len == 0) {
             try w.print("\\fB-{c}\\fP, \\fB--{s}\\fP\n", .{ f.shorthand, f.name });
@@ -142,14 +129,6 @@ fn toUpper(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
     return out;
 }
 
-fn replaceSpaces(allocator: std.mem.Allocator, s: []const u8, with: u8) ![]u8 {
-    const out = try allocator.dupe(u8, s);
-    for (out) |*c| if (c.* == ' ') {
-        c.* = with;
-    };
-    return out;
-}
-
 pub fn genManTree(
     allocator: std.mem.Allocator,
     cmd: *const Command,
@@ -163,17 +142,19 @@ pub fn genManTree(
     }
     const path = try cmd.commandPathString(allocator);
     defer allocator.free(path);
-    const path_dashed = try replaceSpaces(allocator, path, '-');
+    const path_dashed = try util.replaceSpaces(allocator, path, '-');
     defer allocator.free(path_dashed);
-    const basename = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ path_dashed, header.section });
-    defer allocator.free(basename);
-    const filename = try std.fs.path.join(allocator, &.{ dir, basename });
-    defer allocator.free(filename);
-
-    var file = try std.fs.cwd().createFile(filename, .{});
+    // man pages use `.<section>` as their extension (e.g. `.1`). The
+    // header has to be threaded through, so we don't go through
+    // `util.writeToFile` here — the bespoke shape lives inline.
+    const filename_base = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ path_dashed, header.section });
+    defer allocator.free(filename_base);
+    const full = try std.fs.path.join(allocator, &.{ dir, filename_base });
+    defer allocator.free(full);
+    const file = try std.fs.cwd().createFile(full, .{});
     defer file.close();
     var buf: [4096]u8 = undefined;
-    var fw: std.Io.File.Writer = .init(file, std.Io.getStdInDefaultIo(), &buf);
+    var fw = file.writer(&buf);
     try genMan(allocator, cmd, header, &fw.interface);
     try fw.interface.flush();
 }

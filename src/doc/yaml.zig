@@ -39,13 +39,9 @@ pub fn genYaml(
 
     try writeYamlFlagsBlock(allocator, w, "options", &.{ &cmd.flags_set, &cmd.persistent_flags_set }, true);
 
-    var inherited: std.ArrayListUnmanaged(*const zobra.FlagSet) = .empty;
-    defer inherited.deinit(allocator);
-    var p: ?*const Command = cmd.parent;
-    while (p) |up| : (p = up.parent) {
-        try inherited.append(allocator, &up.persistent_flags_set);
-    }
-    try writeYamlFlagsBlock(allocator, w, "inherited_options", inherited.items, true);
+    const inherited = try util.collectInheritedPersistentSets(allocator, cmd);
+    defer allocator.free(inherited);
+    try writeYamlFlagsBlock(allocator, w, "inherited_options", inherited, true);
 
     if (util.hasSeeAlso(cmd)) {
         try w.writeAll("see_also:\n");
@@ -54,11 +50,9 @@ pub fn genYaml(
             defer allocator.free(pname);
             try w.print("- {s}\n", .{pname});
         }
-        const sorted = try util.sortedChildren(allocator, cmd);
-        defer allocator.free(sorted);
-        for (sorted) |child| {
-            if (!util.isAvailableCommand(child)) continue;
-            if (util.isAdditionalHelpTopicCommand(child)) continue;
+        const children = try util.docEligibleChildren(allocator, cmd);
+        defer allocator.free(children);
+        for (children) |child| {
             try w.print("- {s} {s}\n", .{ path, child.commandName() });
         }
     }
@@ -80,42 +74,20 @@ fn writeYamlFlagsBlock(
     sets: []const *const zobra.FlagSet,
     sort_by_name: bool,
 ) !void {
-    var flags: std.ArrayListUnmanaged(*const zobra.flag.Flag) = .empty;
-    defer flags.deinit(allocator);
-    for (sets) |set| for (set.ordered.items) |f| {
-        if (f.hidden) continue;
-        try flags.append(allocator, f);
-    };
-    if (flags.items.len == 0) return;
-    if (sort_by_name) {
-        std.mem.sort(*const zobra.flag.Flag, flags.items, {}, struct {
-            fn lt(_: void, a: *const zobra.flag.Flag, b: *const zobra.flag.Flag) bool {
-                return std.mem.lessThan(u8, a.name, b.name);
-            }
-        }.lt);
-    }
+    _ = sort_by_name; // util.collectVisibleSortedFlags always sorts; cobra's yaml emitter also sorts.
+    const flags = try util.collectVisibleSortedFlags(allocator, sets);
+    defer allocator.free(flags);
+    if (flags.len == 0) return;
 
     try w.print("{s}:\n", .{key});
-    for (flags.items) |f| {
+    for (flags) |f| {
         try w.print("- name: {s}\n", .{f.name});
         if (f.shorthand != 0 and f.deprecated.len == 0) {
             try w.print("  shorthand: {c}\n", .{f.shorthand});
         }
         if (f.usage.len > 0) try w.print("  usage: {s}\n", .{f.usage});
-        if (!isZeroDefault(f)) try w.print("  default_value: {s}\n", .{f.default_value_string});
+        if (!f.isZeroDefault()) try w.print("  default_value: {s}\n", .{f.default_value_string});
     }
-}
-
-fn isZeroDefault(flag: *const zobra.flag.Flag) bool {
-    return switch (flag.value_type) {
-        .bool => std.mem.eql(u8, flag.default_value_string, "false") or flag.default_value_string.len == 0,
-        .duration => std.mem.eql(u8, flag.default_value_string, "0") or std.mem.eql(u8, flag.default_value_string, "0s"),
-        .int, .int8, .int16, .int32, .int64, .uint, .uint8, .uint16, .uint32, .uint64, .count, .float32, .float64 => std.mem.eql(u8, flag.default_value_string, "0"),
-        .string => flag.default_value_string.len == 0,
-        .string_slice, .string_array, .int_slice, .int32_slice, .int64_slice, .float32_slice, .float64_slice, .bool_slice, .duration_slice, .string_to_string, .string_to_int, .string_to_int64, .bytes_hex, .bytes_base64 => std.mem.eql(u8, flag.default_value_string, "[]"),
-        .ip, .ip_mask, .ip_net => flag.default_value_string.len == 0,
-        .custom => flag.default_value_string.len == 0,
-    };
 }
 
 pub fn genYamlTree(
@@ -132,17 +104,7 @@ pub fn genYamlTree(
     defer allocator.free(path);
     const path_u = try util.underscoreSpaces(allocator, path);
     defer allocator.free(path_u);
-    const basename = try std.fmt.allocPrint(allocator, "{s}.yaml", .{path_u});
-    defer allocator.free(basename);
-    const filename = try std.fs.path.join(allocator, &.{ dir, basename });
-    defer allocator.free(filename);
-
-    var file = try std.fs.cwd().createFile(filename, .{});
-    defer file.close();
-    var buf: [4096]u8 = undefined;
-    var fw: std.Io.File.Writer = .init(file, std.Io.getStdInDefaultIo(), &buf);
-    try genYaml(allocator, cmd, &fw.interface);
-    try fw.interface.flush();
+    try util.writeToFile(allocator, dir, path_u, ".yaml", cmd, genYaml);
 }
 
 const testing = std.testing;

@@ -87,32 +87,33 @@ pub fn genMarkdownCustom(
         if (cmd.parent) |parent| {
             const pname = try parent.commandPathString(allocator);
             defer allocator.free(pname);
-            const link_raw = try std.fmt.allocPrint(allocator, "{s}{s}", .{ pname, md_extension });
-            defer allocator.free(link_raw);
-            const link_underscored = try util.underscoreSpaces(allocator, link_raw);
-            defer allocator.free(link_underscored);
-            const link = try link_handler(allocator, link_underscored);
-            defer allocator.free(link);
-            try w.print("* [{s}]({s})\t - {s}\n", .{ pname, link, parent.short });
+            try writeSeeAlsoLink(allocator, w, pname, parent.short, link_handler);
         }
-
-        const sorted = try util.sortedChildren(allocator, cmd);
-        defer allocator.free(sorted);
-        for (sorted) |child| {
-            if (!util.isAvailableCommand(child)) continue;
-            if (util.isAdditionalHelpTopicCommand(child)) continue;
+        const children = try util.docEligibleChildren(allocator, cmd);
+        defer allocator.free(children);
+        for (children) |child| {
             const cname = try std.fmt.allocPrint(allocator, "{s} {s}", .{ path, child.commandName() });
             defer allocator.free(cname);
-            const link_raw = try std.fmt.allocPrint(allocator, "{s}{s}", .{ cname, md_extension });
-            defer allocator.free(link_raw);
-            const link_underscored = try util.underscoreSpaces(allocator, link_raw);
-            defer allocator.free(link_underscored);
-            const link = try link_handler(allocator, link_underscored);
-            defer allocator.free(link);
-            try w.print("* [{s}]({s})\t - {s}\n", .{ cname, link, child.short });
+            try writeSeeAlsoLink(allocator, w, cname, child.short, link_handler);
         }
         try w.writeByte('\n');
     }
+}
+
+fn writeSeeAlsoLink(
+    allocator: std.mem.Allocator,
+    w: *std.Io.Writer,
+    display_path: []const u8,
+    short: []const u8,
+    link_handler: *const fn (std.mem.Allocator, []const u8) anyerror![]u8,
+) !void {
+    const link_raw = try std.fmt.allocPrint(allocator, "{s}{s}", .{ display_path, md_extension });
+    defer allocator.free(link_raw);
+    const link_underscored = try util.underscoreSpaces(allocator, link_raw);
+    defer allocator.free(link_underscored);
+    const link = try link_handler(allocator, link_underscored);
+    defer allocator.free(link);
+    try w.print("* [{s}]({s})\t - {s}\n", .{ display_path, link, short });
 }
 
 fn writeOptionsSection(allocator: std.mem.Allocator, cmd: *const Command, w: *std.Io.Writer) !void {
@@ -152,16 +153,10 @@ fn renderLocalFlags(allocator: std.mem.Allocator, cmd: *const Command) ![]u8 {
 }
 
 fn renderInheritedFlags(allocator: std.mem.Allocator, cmd: *const Command) ![]u8 {
-    var sets: std.ArrayListUnmanaged(*const zobra.FlagSet) = .empty;
-    defer sets.deinit(allocator);
-    var p: ?*const Command = cmd.parent;
-    while (p) |up| : (p = up.parent) {
-        if (countNonHidden(&up.persistent_flags_set) > 0) {
-            try sets.append(allocator, &up.persistent_flags_set);
-        }
-    }
-    if (sets.items.len == 0) return allocator.dupe(u8, "");
-    return renderFlagsBlock(allocator, sets.items);
+    const sets = try util.collectInheritedPersistentSets(allocator, cmd);
+    defer allocator.free(sets);
+    if (sets.len == 0) return allocator.dupe(u8, "");
+    return renderFlagsBlock(allocator, sets);
 }
 
 fn countNonHidden(set: *const zobra.FlagSet) usize {
@@ -176,17 +171,8 @@ fn countNonHidden(set: *const zobra.FlagSet) usize {
 /// help/usage.flagUsagesMerged but in this module to avoid a private
 /// import. Sort by name; pflag-byte-aligned columns.
 fn renderFlagsBlock(allocator: std.mem.Allocator, sets: []const *const zobra.FlagSet) ![]u8 {
-    var flags: std.ArrayListUnmanaged(*const zobra.flag.Flag) = .empty;
-    defer flags.deinit(allocator);
-    for (sets) |set| for (set.ordered.items) |f| {
-        if (f.hidden) continue;
-        try flags.append(allocator, f);
-    };
-    std.mem.sort(*const zobra.flag.Flag, flags.items, {}, struct {
-        fn lt(_: void, a: *const zobra.flag.Flag, b: *const zobra.flag.Flag) bool {
-            return std.mem.lessThan(u8, a.name, b.name);
-        }
-    }.lt);
+    const flags = try util.collectVisibleSortedFlags(allocator, sets);
+    defer allocator.free(flags);
 
     var prefix_lines: std.ArrayListUnmanaged([]u8) = .empty;
     defer {
@@ -200,7 +186,7 @@ fn renderFlagsBlock(allocator: std.mem.Allocator, sets: []const *const zobra.Fla
     }
 
     var maxlen: usize = 0;
-    for (flags.items) |flag| {
+    for (flags) |flag| {
         const prefix = try renderPrefix(allocator, flag);
         const tail = try renderTail(allocator, flag);
         if (prefix.len > maxlen) maxlen = prefix.len;
@@ -230,7 +216,7 @@ fn renderPrefix(allocator: std.mem.Allocator, flag: *const zobra.flag.Flag) ![]u
     } else {
         try w.print("      --{s}", .{flag.name});
     }
-    const tn = typeNameFor(flag.value_type, flag);
+    const tn = flag.typeName();
     if (tn.len > 0) try w.print(" {s}", .{tn});
     if (flag.no_opt_def_val.len > 0) {
         switch (flag.value_type) {
@@ -252,7 +238,7 @@ fn renderTail(allocator: std.mem.Allocator, flag: *const zobra.flag.Flag) ![]u8 
     defer aw.deinit();
     const w = &aw.writer;
     try w.writeAll(flag.usage);
-    if (!isZeroDefault(flag)) {
+    if (!flag.isZeroDefault()) {
         if (flag.value_type == .string) {
             try w.print(" (default \"{s}\")", .{flag.default_value_string});
         } else {
@@ -263,55 +249,6 @@ fn renderTail(allocator: std.mem.Allocator, flag: *const zobra.flag.Flag) ![]u8 
         try w.print(" (DEPRECATED: {s})", .{flag.deprecated});
     }
     return aw.toOwnedSlice();
-}
-
-fn typeNameFor(t: zobra.flag.ValueType, flag: *const zobra.flag.Flag) []const u8 {
-    return switch (t) {
-        .string => "string",
-        .bool => "",
-        .int, .int64 => "int",
-        .int8 => "int8",
-        .int16 => "int16",
-        .int32 => "int32",
-        .uint, .uint64 => "uint",
-        .uint8 => "uint8",
-        .uint16 => "uint16",
-        .uint32 => "uint32",
-        .float32 => "float32",
-        .float64 => "float",
-        .count => "count",
-        .duration => "duration",
-        .string_slice => "strings",
-        .string_array => "stringArray",
-        .int_slice => "ints",
-        .int32_slice => "int32Slice",
-        .int64_slice => "int64Slice",
-        .float32_slice => "float32Slice",
-        .float64_slice => "float64Slice",
-        .bool_slice => "bools",
-        .duration_slice => "durationSlice",
-        .string_to_string => "stringToString",
-        .string_to_int => "stringToInt",
-        .string_to_int64 => "stringToInt64",
-        .ip => "ip",
-        .ip_mask => "ipMask",
-        .ip_net => "ipNet",
-        .bytes_hex => "bytesHex",
-        .bytes_base64 => "bytesBase64",
-        .custom => if (flag.custom) |c| c.type_name else "",
-    };
-}
-
-fn isZeroDefault(flag: *const zobra.flag.Flag) bool {
-    return switch (flag.value_type) {
-        .bool => std.mem.eql(u8, flag.default_value_string, "false") or flag.default_value_string.len == 0,
-        .duration => std.mem.eql(u8, flag.default_value_string, "0") or std.mem.eql(u8, flag.default_value_string, "0s"),
-        .int, .int8, .int16, .int32, .int64, .uint, .uint8, .uint16, .uint32, .uint64, .count, .float32, .float64 => std.mem.eql(u8, flag.default_value_string, "0"),
-        .string => flag.default_value_string.len == 0,
-        .string_slice, .string_array, .int_slice, .int32_slice, .int64_slice, .float32_slice, .float64_slice, .bool_slice, .duration_slice, .string_to_string, .string_to_int, .string_to_int64, .bytes_hex, .bytes_base64 => std.mem.eql(u8, flag.default_value_string, "[]"),
-        .ip, .ip_mask, .ip_net => flag.default_value_string.len == 0,
-        .custom => flag.default_value_string.len == 0,
-    };
 }
 
 /// Walk the command tree and write one markdown file per non-hidden,
@@ -356,7 +293,7 @@ pub fn genMarkdownTreeCustom(
     defer file.close();
 
     var buf: [4096]u8 = undefined;
-    var fw: std.Io.File.Writer = .init(file, std.Io.getStdInDefaultIo(), &buf);
+    var fw = file.writer(&buf);
     const w = &fw.interface;
 
     const prepend = try file_prepender(allocator, filename);

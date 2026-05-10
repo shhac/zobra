@@ -127,6 +127,64 @@ pub const Flag = struct {
     /// HashMap and need deinit). Distinct from owns_value_storage so the
     /// per-type free dispatch doesn't conflate the two.
     owns_map_storage: bool = false,
+
+    /// True when `default_value_string` represents the zero value for the
+    /// flag's type. Mirrors pflag.defaultIsZeroValue. The help renderer
+    /// and doc generators consult this to decide whether to emit a
+    /// `(default ...)` annotation.
+    pub fn isZeroDefault(self: *const Flag) bool {
+        return switch (self.value_type) {
+            .bool => std.mem.eql(u8, self.default_value_string, "false") or self.default_value_string.len == 0,
+            .duration => std.mem.eql(u8, self.default_value_string, "0") or std.mem.eql(u8, self.default_value_string, "0s"),
+            .int, .int8, .int16, .int32, .int64, .uint, .uint8, .uint16, .uint32, .uint64, .count, .float32, .float64 => std.mem.eql(u8, self.default_value_string, "0"),
+            .string => self.default_value_string.len == 0,
+            .string_slice, .string_array, .int_slice, .int32_slice, .int64_slice, .float32_slice, .float64_slice, .bool_slice, .duration_slice, .string_to_string, .string_to_int, .string_to_int64, .bytes_hex, .bytes_base64 => std.mem.eql(u8, self.default_value_string, "[]"),
+            .ip, .ip_mask, .ip_net => self.default_value_string.len == 0,
+            .custom => self.default_value_string.len == 0,
+        };
+    }
+
+    /// Cobra/pflag-style display name for this flag's type. Used by the
+    /// help renderer and doc generators when emitting the type column.
+    /// Custom flags consult their vtable's `type_name`.
+    pub fn typeName(self: *const Flag) []const u8 {
+        return switch (self.value_type) {
+            .bool => "",
+            .string => "string",
+            .duration => "duration",
+            .int => "int",
+            .int8 => "int8",
+            .int16 => "int16",
+            .int32 => "int32",
+            .int64 => "int",
+            .uint => "uint",
+            .uint8 => "uint8",
+            .uint16 => "uint16",
+            .uint32 => "uint32",
+            .uint64 => "uint",
+            .float32 => "float32",
+            .float64 => "float",
+            .count => "count",
+            .string_slice => "strings",
+            .string_array => "stringArray",
+            .int_slice => "ints",
+            .int32_slice => "int32Slice",
+            .int64_slice => "int64Slice",
+            .float32_slice => "float32Slice",
+            .float64_slice => "float64Slice",
+            .bool_slice => "bools",
+            .duration_slice => "durationSlice",
+            .string_to_string => "stringToString",
+            .string_to_int => "stringToInt",
+            .string_to_int64 => "stringToInt64",
+            .bytes_hex => "bytesHex",
+            .bytes_base64 => "bytesBase64",
+            .ip => "ip",
+            .ip_mask => "ipMask",
+            .ip_net => "ipNet",
+            .custom => if (self.custom) |c| c.type_name else "",
+        };
+    }
 };
 
 pub const FlagSet = struct {

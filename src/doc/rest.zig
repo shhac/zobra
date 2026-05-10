@@ -54,13 +54,9 @@ pub fn genReST(
         try w.writeAll("\n");
     }
 
-    var inherited: std.ArrayListUnmanaged(*const zobra.FlagSet) = .empty;
-    defer inherited.deinit(allocator);
-    var p: ?*const Command = cmd.parent;
-    while (p) |up| : (p = up.parent) {
-        try inherited.append(allocator, &up.persistent_flags_set);
-    }
-    const inh = try renderFlagsAsLiteralBlock(allocator, inherited.items);
+    const inherited = try util.collectInheritedPersistentSets(allocator, cmd);
+    defer allocator.free(inherited);
+    const inh = try renderFlagsAsLiteralBlock(allocator, inherited);
     defer allocator.free(inh);
     if (inh.len > 0) {
         try w.writeAll("Options inherited from parent commands\n~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n\n::\n\n");
@@ -73,23 +69,28 @@ pub fn genReST(
         if (cmd.parent) |parent| {
             const pname = try parent.commandPathString(allocator);
             defer allocator.free(pname);
-            const pnu = try util.underscoreSpaces(allocator, pname);
-            defer allocator.free(pnu);
-            try w.print("* :ref:`{s} <{s}>` \t - {s}\n", .{ pname, pnu, parent.short });
+            try writeRestLink(allocator, w, pname, parent.short);
         }
-        const sorted = try util.sortedChildren(allocator, cmd);
-        defer allocator.free(sorted);
-        for (sorted) |child| {
-            if (!util.isAvailableCommand(child)) continue;
-            if (util.isAdditionalHelpTopicCommand(child)) continue;
+        const children = try util.docEligibleChildren(allocator, cmd);
+        defer allocator.free(children);
+        for (children) |child| {
             const cname = try std.fmt.allocPrint(allocator, "{s} {s}", .{ path, child.commandName() });
             defer allocator.free(cname);
-            const cnu = try util.underscoreSpaces(allocator, cname);
-            defer allocator.free(cnu);
-            try w.print("* :ref:`{s} <{s}>` \t - {s}\n", .{ cname, cnu, child.short });
+            try writeRestLink(allocator, w, cname, child.short);
         }
         try w.writeByte('\n');
     }
+}
+
+fn writeRestLink(
+    allocator: std.mem.Allocator,
+    w: *std.Io.Writer,
+    display_path: []const u8,
+    short: []const u8,
+) !void {
+    const target = try util.underscoreSpaces(allocator, display_path);
+    defer allocator.free(target);
+    try w.print("* :ref:`{s} <{s}>` \t - {s}\n", .{ display_path, target, short });
 }
 
 fn makeUnderline(allocator: std.mem.Allocator, len: usize, ch: u8) ![]u8 {
@@ -110,23 +111,14 @@ fn writeIndentedLines(w: *std.Io.Writer, text: []const u8, indent: []const u8) !
 /// Render flag list as a ReST literal block: each line indented by 2
 /// spaces (the `::\n\n` literal-block convention).
 fn renderFlagsAsLiteralBlock(allocator: std.mem.Allocator, sets: []const *const zobra.FlagSet) ![]u8 {
-    var flags: std.ArrayListUnmanaged(*const zobra.flag.Flag) = .empty;
-    defer flags.deinit(allocator);
-    for (sets) |set| for (set.ordered.items) |f| {
-        if (f.hidden) continue;
-        try flags.append(allocator, f);
-    };
-    if (flags.items.len == 0) return allocator.dupe(u8, "");
-    std.mem.sort(*const zobra.flag.Flag, flags.items, {}, struct {
-        fn lt(_: void, a: *const zobra.flag.Flag, b: *const zobra.flag.Flag) bool {
-            return std.mem.lessThan(u8, a.name, b.name);
-        }
-    }.lt);
+    const flags = try util.collectVisibleSortedFlags(allocator, sets);
+    defer allocator.free(flags);
+    if (flags.len == 0) return allocator.dupe(u8, "");
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     const w = &aw.writer;
-    for (flags.items) |f| {
+    for (flags) |f| {
         try w.writeAll("  "); // ReST literal block indent
         if (f.shorthand != 0 and f.deprecated.len == 0) {
             try w.print("-{c}, --{s}", .{ f.shorthand, f.name });
@@ -153,17 +145,7 @@ pub fn genReSTTree(
     defer allocator.free(path);
     const path_u = try util.underscoreSpaces(allocator, path);
     defer allocator.free(path_u);
-    const basename = try std.fmt.allocPrint(allocator, "{s}{s}", .{ path_u, rst_extension });
-    defer allocator.free(basename);
-    const filename = try std.fs.path.join(allocator, &.{ dir, basename });
-    defer allocator.free(filename);
-
-    var file = try std.fs.cwd().createFile(filename, .{});
-    defer file.close();
-    var buf: [4096]u8 = undefined;
-    var fw: std.Io.File.Writer = .init(file, std.Io.getStdInDefaultIo(), &buf);
-    try genReST(allocator, cmd, &fw.interface);
-    try fw.interface.flush();
+    try util.writeToFile(allocator, dir, path_u, rst_extension, cmd, genReST);
 }
 
 const testing = std.testing;
