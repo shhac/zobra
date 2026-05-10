@@ -42,9 +42,9 @@ pub fn parseLong(
     // Negation handling. zobra divergence: any boolean flag is universally
     // negatable via --no-foo, even though pflag requires NoOptDefVal opt-in.
     // A flag literally registered as "no-foo" wins over the negation reading.
-    if (attached == null and isNoPrefixed(name) and !schema.is_known_long(name)) {
+    if (attached == null and isNoPrefixed(name) and !schema.is_known_long(schema.ctx, name)) {
         const stripped = name[no_prefix.len..];
-        if (stripped.len > 0 and schema.is_boolean_long(stripped)) {
+        if (stripped.len > 0 and schema.is_boolean_long(schema.ctx, stripped)) {
             try out.append(allocator, .{ .negated = .{ .name = stripped, .raw = s } });
             i.* += 1;
             return;
@@ -62,7 +62,7 @@ pub fn parseLong(
         return;
     }
 
-    if (schema.is_value_taking_long(name)) {
+    if (schema.is_value_taking_long(schema.ctx, name)) {
         if (i.* + 1 < argv.len) {
             const value = argv[i.* + 1];
             try out.append(allocator, .{ .long = .{ .name = name, .value = value, .raw = s } });
@@ -90,16 +90,18 @@ fn isNoPrefixed(name: []const u8) bool {
 
 const testing = std.testing;
 
+var dummy_ctx: u8 = 0;
+
 const stringFalse = struct {
-    fn f(_: []const u8) bool {
+    fn f(_: *const anyopaque, _: []const u8) bool {
         return false;
     }
 }.f;
 
 const stringEqlFactory = struct {
-    fn make(comptime want: []const u8) *const fn ([]const u8) bool {
+    fn make(comptime want: []const u8) *const fn (*const anyopaque, []const u8) bool {
         return struct {
-            fn f(name: []const u8) bool {
+            fn f(_: *const anyopaque, name: []const u8) bool {
                 return std.mem.eql(u8, name, want);
             }
         }.f;
@@ -108,8 +110,9 @@ const stringEqlFactory = struct {
 
 fn schemaWithBoolean(comptime name: []const u8) FlagSchema {
     return .{
+        .ctx = &dummy_ctx,
         .is_value_taking_short = struct {
-            fn f(_: u8) bool {
+            fn f(_: *const anyopaque, _: u8) bool {
                 return false;
             }
         }.f,
@@ -121,8 +124,9 @@ fn schemaWithBoolean(comptime name: []const u8) FlagSchema {
 
 fn schemaWithValueLong(comptime name: []const u8) FlagSchema {
     return .{
+        .ctx = &dummy_ctx,
         .is_value_taking_short = struct {
-            fn f(_: u8) bool {
+            fn f(_: *const anyopaque, _: u8) bool {
                 return false;
             }
         }.f,
@@ -234,8 +238,9 @@ test "parseLong: --no-foo without boolean foo emits regular long" {
 test "parseLong: literal --no-foo flag wins over negation" {
     const gpa = testing.allocator;
     const schema: FlagSchema = .{
+        .ctx = &dummy_ctx,
         .is_value_taking_short = struct {
-            fn f(_: u8) bool {
+            fn f(_: *const anyopaque, _: u8) bool {
                 return false;
             }
         }.f,

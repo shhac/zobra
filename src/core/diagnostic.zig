@@ -20,6 +20,10 @@ pub const Diagnostic = struct {
     /// Raw argv element that produced the error. Always borrowed from argv.
     raw: ?[]const u8 = null,
 
+    /// The string passed to the coerce step (e.g. "foo" for --retries=foo).
+    /// Distinct from `raw` (which carries the full argv element).
+    raw_value: ?[]const u8 = null,
+
     /// For shorthand-group errors: the *remaining* shorthand chars at the
     /// point of error, **without** the leading `-`. Mirrors pflag's
     /// `specifiedShorthands` field exactly. For argv `-abc` failing on `b`,
@@ -56,6 +60,7 @@ pub const Diagnostic = struct {
         required_flag_missing,
         flag_group_violation,
         deprecated_flag_used,
+        no_such_flag,
         args_validation_failed,
         no_run_defined,
     };

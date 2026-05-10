@@ -15,28 +15,36 @@ const long_mod = @import("long.zig");
 const short_mod = @import("short.zig");
 
 /// Schema view the parser uses to disambiguate value-taking flags from
-/// boolean / count flags. The flag layer is responsible for building a
-/// schema that already accounts for inherited persistent flags.
+/// boolean / count flags. The flag layer builds one of these from a
+/// FlagSet (accounting for inherited persistent flags).
+///
+/// `ctx` is a borrowed pointer to whatever data the predicates need —
+/// typically the FlagSet itself. Because Zig has no closures, we pass
+/// state through this side channel.
 pub const FlagSchema = struct {
-    is_value_taking_short: *const fn (c: u8) bool,
-    is_value_taking_long: *const fn (name: []const u8) bool,
-    is_known_long: *const fn (name: []const u8) bool,
-    is_boolean_long: *const fn (name: []const u8) bool,
+    ctx: *const anyopaque,
+    is_value_taking_short: *const fn (ctx: *const anyopaque, c: u8) bool,
+    is_value_taking_long: *const fn (ctx: *const anyopaque, name: []const u8) bool,
+    is_known_long: *const fn (ctx: *const anyopaque, name: []const u8) bool,
+    is_boolean_long: *const fn (ctx: *const anyopaque, name: []const u8) bool,
 
     /// Schema where every flag is unknown — handy for the flag-layerless
     /// smoke tests. With this schema the parser still emits tokens; the
     /// flag layer would reject unknowns.
     pub const empty: FlagSchema = .{
+        .ctx = &empty_ctx,
         .is_value_taking_short = noShort,
         .is_value_taking_long = noLong,
         .is_known_long = noLong,
         .is_boolean_long = noLong,
     };
 
-    fn noShort(_: u8) bool {
+    var empty_ctx: u8 = 0;
+
+    fn noShort(_: *const anyopaque, _: u8) bool {
         return false;
     }
-    fn noLong(_: []const u8) bool {
+    fn noLong(_: *const anyopaque, _: []const u8) bool {
         return false;
     }
 };

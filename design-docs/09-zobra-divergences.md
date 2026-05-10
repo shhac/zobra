@@ -47,6 +47,16 @@ These cobra features won't ship in zobra. Each has a workaround.
 | `Command.SetContext` / `Command.Context` | Go's `context.Context` doesn't have a Zig analogue. | `cmd.bindContext(*anyopaque)` + retrieve from hooks (Phase ≥3). |
 | `Command.TraverseChildren` | Already covered by persistent-flag inheritance in zobra. | No-op; the behaviour comes for free. |
 
+## 3.5 strconv parity exceptions
+
+These are minor incompatibilities with Go's strconv that surface only in unusual inputs. None affect normal CLI usage but are documented so a fixture-failing test doesn't surprise a future maintainer.
+
+| Behaviour | strconv (Go) | zobra | Reason |
+|---|---|---|---|
+| Underscore digit separators (`1_000`) | rejected | accepted | Zig's `std.fmt.parseInt` accepts `_`. Won't surface unless a CLI explicitly tests it. |
+| Hex float literals (`0x1.fp10`) | accepted | matches | Zig parseFloat handles. |
+| Leading-zero octal (`0664`) | accepted | accepted | We added an explicit branch in `coerce.zig` because Zig's parseInt requires `0o` prefix; we mirror Go strconv. |
+
 ## 4. The "stricter than cobra" set
 
 These are places zobra is *more strict* than cobra, with the cobra behaviour considered a quirk we choose not to inherit:

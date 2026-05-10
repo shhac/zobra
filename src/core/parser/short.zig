@@ -35,7 +35,7 @@ pub fn parseShort(
             break;
         }
 
-        if (schema.is_value_taking_short(c)) {
+        if (schema.is_value_taking_short(schema.ctx, c)) {
             if (rest.len > 0) {
                 // `-farg` — rest is the value.
                 try out.append(allocator, .{ .short = .{ .name = c, .value = rest, .raw = s } });
@@ -69,10 +69,12 @@ pub fn parseShort(
 
 const testing = std.testing;
 
+var dummy_ctx: u8 = 0;
+
 const valueTakingFactory = struct {
-    fn make(comptime ch: u8) *const fn (u8) bool {
+    fn make(comptime ch: u8) *const fn (*const anyopaque, u8) bool {
         return struct {
-            fn f(c: u8) bool {
+            fn f(_: *const anyopaque, c: u8) bool {
                 return c == ch;
             }
         }.f;
@@ -81,19 +83,20 @@ const valueTakingFactory = struct {
 
 fn schemaShortValue(comptime ch: u8) FlagSchema {
     return .{
+        .ctx = &dummy_ctx,
         .is_value_taking_short = valueTakingFactory.make(ch),
         .is_value_taking_long = struct {
-            fn f(_: []const u8) bool {
+            fn f(_: *const anyopaque, _: []const u8) bool {
                 return false;
             }
         }.f,
         .is_known_long = struct {
-            fn f(_: []const u8) bool {
+            fn f(_: *const anyopaque, _: []const u8) bool {
                 return false;
             }
         }.f,
         .is_boolean_long = struct {
-            fn f(_: []const u8) bool {
+            fn f(_: *const anyopaque, _: []const u8) bool {
                 return false;
             }
         }.f,

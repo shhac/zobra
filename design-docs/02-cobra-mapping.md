@@ -134,19 +134,19 @@ Same alphabet as cobra/pflag, with Zig representations:
 |---|---|---|
 | `StringVarP` | `stringVarP` | `*[]const u8` |
 | `BoolVarP` | `boolVarP` | `*bool` |
-| `IntVarP` | `intVarP` | `*i32` |
+| `IntVarP` | `intVarP` | `*i64` (matches Go's `int` on 64-bit; the dominant target) |
 | `Int8VarP` | `int8VarP` | `*i8` |
 | `Int16VarP` | `int16VarP` | `*i16` |
 | `Int32VarP` | `int32VarP` | `*i32` |
 | `Int64VarP` | `int64VarP` | `*i64` |
-| `UintVarP` | `uintVarP` | `*u32` |
+| `UintVarP` | `uintVarP` | `*u64` (matches Go's `uint` on 64-bit) |
 | `Uint8VarP` | `uint8VarP` | `*u8` |
 | `Uint16VarP` | `uint16VarP` | `*u16` |
 | `Uint32VarP` | `uint32VarP` | `*u32` |
 | `Uint64VarP` | `uint64VarP` | `*u64` |
 | `Float32VarP` | `float32VarP` | `*f32` |
 | `Float64VarP` | `float64VarP` | `*f64` |
-| `CountVarP` | `countVarP` | `*i32` |
+| `CountVarP` | `countVarP` | `*i32` (counts in practice are small; keeping this slim) |
 | `DurationVarP` | `durationVarP` | `*i64` (nanoseconds, like Go's `time.Duration`) |
 
 ### Slices

@@ -21,6 +21,9 @@ pub const FlagError = error{
     TypeCoercionFailed,
     RequiredFlagMissing,
     FlagGroupViolation,
+    /// `FlagSet.set("name", …)` called for a name that isn't registered.
+    /// Mirrors pflag's `no such flag -<name>` error.
+    NoSuchFlag,
 };
 
 pub const CommandError = error{

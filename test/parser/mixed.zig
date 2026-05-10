@@ -7,29 +7,32 @@ const zobra = @import("zobra");
 const FlagSchema = zobra.parser.FlagSchema;
 const parse = zobra.parser.parse;
 
+var dummy_ctx: u8 = 0;
+
 fn schemaWith(
     comptime value_short: u8,
     comptime value_long: []const u8,
     comptime bool_long: []const u8,
 ) FlagSchema {
     return .{
+        .ctx = &dummy_ctx,
         .is_value_taking_short = struct {
-            fn f(c: u8) bool {
+            fn f(_: *const anyopaque, c: u8) bool {
                 return c == value_short;
             }
         }.f,
         .is_value_taking_long = struct {
-            fn f(name: []const u8) bool {
+            fn f(_: *const anyopaque, name: []const u8) bool {
                 return std.mem.eql(u8, name, value_long);
             }
         }.f,
         .is_known_long = struct {
-            fn f(name: []const u8) bool {
+            fn f(_: *const anyopaque, name: []const u8) bool {
                 return std.mem.eql(u8, name, value_long) or std.mem.eql(u8, name, bool_long);
             }
         }.f,
         .is_boolean_long = struct {
-            fn f(name: []const u8) bool {
+            fn f(_: *const anyopaque, name: []const u8) bool {
                 return std.mem.eql(u8, name, bool_long);
             }
         }.f,

@@ -24,6 +24,15 @@ pub const parser = struct {
     pub const Token = @import("core/parser/token.zig").Token;
 };
 
+pub const flag = struct {
+    const flag_mod = @import("core/flag/flag.zig");
+    pub const FlagSet = flag_mod.FlagSet;
+    pub const ValueType = flag_mod.ValueType;
+    pub const Flag = flag_mod.Flag;
+};
+
+pub const FlagSet = flag.FlagSet;
+
 /// Writes a placeholder banner to the given writer. Goes away once the
 /// example exe has something more meaningful to show (Phase 3).
 pub fn hello(writer: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -38,6 +47,9 @@ test {
     _ = @import("core/parser/token.zig");
     _ = @import("core/parser/long.zig");
     _ = @import("core/parser/short.zig");
+    _ = @import("core/flag/coerce.zig");
+    _ = @import("core/flag/duration.zig");
+    _ = @import("core/flag/flag.zig");
 }
 
 test "version is non-empty" {

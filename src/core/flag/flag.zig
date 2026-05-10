@@ -1,0 +1,894 @@
+//! FlagSet — registry of flag definitions, plus the `apply` loop that
+//! binds parser tokens into the user's `*T` storage.
+//!
+//! Source of truth: pflag's `FlagSet` in flag.go. The shape mirrors pflag
+//! (formal/shorthand maps, Flag record with NoOptDefVal / Changed / Hidden
+//! / Deprecated / DefValue) with two Zig adaptations:
+//!   1. The `Value` interface becomes a `ValueType` enum + `*anyopaque`
+//!      pointer to the user's typed storage (Zig has no nominal interfaces).
+//!   2. Allocation is explicit. The FlagSet owns its internal maps and the
+//!      rendered default-value strings; user-supplied name/shorthand/usage
+//!      are borrow-only (per design-docs/08-allocator-conventions.md).
+//!
+//! See design-docs/02-cobra-mapping.md for the per-type flag table and
+//! design-docs/07-error-model.md for the Diagnostic-out-parameter contract.
+
+const std = @import("std");
+const errors = @import("../errors.zig");
+const Diagnostic = @import("../diagnostic.zig").Diagnostic;
+const fillDiag = @import("../diagnostic.zig").fill;
+const coerce = @import("coerce.zig");
+const duration = @import("duration.zig");
+const parser_mod = @import("../parser/parser.zig");
+const Token = @import("../parser/token.zig").Token;
+
+pub const FlagSchema = parser_mod.FlagSchema;
+
+/// All scalar value types zobra's *VarP methods bind. The CustomFlag
+/// vtable (Phase 5c) will land as another variant.
+pub const ValueType = enum {
+    string,
+    bool,
+    int, // *i64 — matches Go's int width on 64-bit platforms
+    int8,
+    int16,
+    int32,
+    int64,
+    uint, // *u64 — matches Go's uint width on 64-bit platforms
+    uint8,
+    uint16,
+    uint32,
+    uint64,
+    float32,
+    float64,
+    count, // *i32 — increments on each occurrence; matches pflag's count
+    duration, // *i64 — nanoseconds, matches Go's time.Duration
+
+    pub fn isBoolean(self: ValueType) bool {
+        return self == .bool;
+    }
+
+    pub fn isCount(self: ValueType) bool {
+        return self == .count;
+    }
+};
+
+pub const Flag = struct {
+    name: []const u8,
+    shorthand: u8, // 0 means no shorthand
+    usage: []const u8,
+    value_type: ValueType,
+    value_ptr: *anyopaque,
+    /// Default rendered as a string for help. Owned by the FlagSet.
+    default_value_string: []const u8,
+    /// Empty for value-taking flags. "true" for bools, "+1" for counts.
+    no_opt_def_val: []const u8,
+    changed: bool,
+    hidden: bool,
+    required: bool,
+    /// "" if not deprecated; otherwise the user-supplied replacement message.
+    /// Borrowed.
+    deprecated: []const u8,
+    /// Whether the FlagSet owns `default_value_string` and should free it.
+    owns_default: bool,
+};
+
+pub const FlagSet = struct {
+    allocator: std.mem.Allocator,
+    formal: std.StringHashMapUnmanaged(*Flag),
+    shorthands: [256]?*Flag,
+    ordered: std.ArrayListUnmanaged(*Flag),
+    /// Positional arguments collected during `apply` (after subtracting
+    /// flag tokens). `args_len_at_dash` records `args.len` at the point
+    /// `--` was seen, mirroring pflag's `argsLenAtDash`.
+    args: std.ArrayListUnmanaged([]const u8),
+    args_len_at_dash: ?usize,
+
+    pub fn init(allocator: std.mem.Allocator) FlagSet {
+        return .{
+            .allocator = allocator,
+            .formal = .empty,
+            .shorthands = @splat(null),
+            .ordered = .empty,
+            .args = .empty,
+            .args_len_at_dash = null,
+        };
+    }
+
+    pub fn deinit(self: *FlagSet) void {
+        for (self.ordered.items) |flag| {
+            if (flag.owns_default) self.allocator.free(flag.default_value_string);
+            self.allocator.destroy(flag);
+        }
+        self.formal.deinit(self.allocator);
+        self.ordered.deinit(self.allocator);
+        self.args.deinit(self.allocator);
+    }
+
+    // ---- registration ---------------------------------------------------
+
+    pub const RegisterError = error{
+        FlagRedefined,
+        ShorthandRedefined,
+        ShorthandTooLong,
+    } || std.mem.Allocator.Error;
+
+    fn addFlag(
+        self: *FlagSet,
+        spec: struct {
+            name: []const u8,
+            shorthand: u8 = 0,
+            usage: []const u8,
+            value_type: ValueType,
+            value_ptr: *anyopaque,
+            default_value_string: []const u8,
+            owns_default: bool,
+            no_opt_def_val: []const u8,
+        },
+    ) RegisterError!*Flag {
+        if (self.formal.contains(spec.name)) return error.FlagRedefined;
+        if (spec.shorthand != 0 and self.shorthands[spec.shorthand] != null) {
+            return error.ShorthandRedefined;
+        }
+
+        const flag = try self.allocator.create(Flag);
+        errdefer self.allocator.destroy(flag);
+        flag.* = .{
+            .name = spec.name,
+            .shorthand = spec.shorthand,
+            .usage = spec.usage,
+            .value_type = spec.value_type,
+            .value_ptr = spec.value_ptr,
+            .default_value_string = spec.default_value_string,
+            .owns_default = spec.owns_default,
+            .no_opt_def_val = spec.no_opt_def_val,
+            .changed = false,
+            .hidden = false,
+            .required = false,
+            .deprecated = "",
+        };
+
+        try self.formal.put(self.allocator, spec.name, flag);
+        errdefer _ = self.formal.remove(spec.name);
+
+        try self.ordered.append(self.allocator, flag);
+        errdefer _ = self.ordered.pop();
+
+        if (spec.shorthand != 0) self.shorthands[spec.shorthand] = flag;
+        return flag;
+    }
+
+    // ---- typed *VarP entry points --------------------------------------
+
+    pub fn stringVarP(
+        self: *FlagSet,
+        ptr: *[]const u8,
+        name: []const u8,
+        shorthand: u8,
+        default: []const u8,
+        usage: []const u8,
+    ) !void {
+        ptr.* = default;
+        _ = try self.addFlag(.{
+            .name = name,
+            .shorthand = shorthand,
+            .usage = usage,
+            .value_type = .string,
+            .value_ptr = @ptrCast(ptr),
+            .default_value_string = default,
+            .owns_default = false,
+            .no_opt_def_val = "",
+        });
+    }
+
+    pub fn boolVarP(
+        self: *FlagSet,
+        ptr: *bool,
+        name: []const u8,
+        shorthand: u8,
+        default: bool,
+        usage: []const u8,
+    ) !void {
+        ptr.* = default;
+        const ds = try self.allocator.dupe(u8, if (default) "true" else "false");
+        errdefer self.allocator.free(ds);
+        _ = try self.addFlag(.{
+            .name = name,
+            .shorthand = shorthand,
+            .usage = usage,
+            .value_type = .bool,
+            .value_ptr = @ptrCast(ptr),
+            .default_value_string = ds,
+            .owns_default = true,
+            .no_opt_def_val = "true",
+        });
+    }
+
+    pub fn countVarP(
+        self: *FlagSet,
+        ptr: *i32,
+        name: []const u8,
+        shorthand: u8,
+        usage: []const u8,
+    ) !void {
+        ptr.* = 0;
+        const ds = try self.allocator.dupe(u8, "0");
+        errdefer self.allocator.free(ds);
+        _ = try self.addFlag(.{
+            .name = name,
+            .shorthand = shorthand,
+            .usage = usage,
+            .value_type = .count,
+            .value_ptr = @ptrCast(ptr),
+            .default_value_string = ds,
+            .owns_default = true,
+            .no_opt_def_val = "+1",
+        });
+    }
+
+    pub fn durationVarP(
+        self: *FlagSet,
+        ptr: *i64,
+        name: []const u8,
+        shorthand: u8,
+        default: i64,
+        usage: []const u8,
+    ) !void {
+        ptr.* = default;
+        const ds = try std.fmt.allocPrint(self.allocator, "{d}", .{default});
+        errdefer self.allocator.free(ds);
+        _ = try self.addFlag(.{
+            .name = name,
+            .shorthand = shorthand,
+            .usage = usage,
+            .value_type = .duration,
+            .value_ptr = @ptrCast(ptr),
+            .default_value_string = ds,
+            .owns_default = true,
+            .no_opt_def_val = "",
+        });
+    }
+
+    /// Generic numeric *VarP — used internally; the public wrappers below
+    /// pin the exact (T, ValueType) pair so call sites are type-checked.
+    fn registerNumeric(
+        self: *FlagSet,
+        comptime T: type,
+        comptime tag: ValueType,
+        ptr: *T,
+        name: []const u8,
+        shorthand: u8,
+        default: T,
+        usage: []const u8,
+    ) !void {
+        ptr.* = default;
+        const ds = if (@typeInfo(T) == .int)
+            try std.fmt.allocPrint(self.allocator, "{d}", .{default})
+        else
+            try std.fmt.allocPrint(self.allocator, "{d}", .{default});
+        errdefer self.allocator.free(ds);
+        _ = try self.addFlag(.{
+            .name = name,
+            .shorthand = shorthand,
+            .usage = usage,
+            .value_type = tag,
+            .value_ptr = @ptrCast(ptr),
+            .default_value_string = ds,
+            .owns_default = true,
+            .no_opt_def_val = "",
+        });
+    }
+
+    pub fn intVarP(self: *FlagSet, ptr: *i64, name: []const u8, shorthand: u8, default: i64, usage: []const u8) !void {
+        return self.registerNumeric(i64, .int, ptr, name, shorthand, default, usage);
+    }
+    pub fn int8VarP(self: *FlagSet, ptr: *i8, name: []const u8, shorthand: u8, default: i8, usage: []const u8) !void {
+        return self.registerNumeric(i8, .int8, ptr, name, shorthand, default, usage);
+    }
+    pub fn int16VarP(self: *FlagSet, ptr: *i16, name: []const u8, shorthand: u8, default: i16, usage: []const u8) !void {
+        return self.registerNumeric(i16, .int16, ptr, name, shorthand, default, usage);
+    }
+    pub fn int32VarP(self: *FlagSet, ptr: *i32, name: []const u8, shorthand: u8, default: i32, usage: []const u8) !void {
+        return self.registerNumeric(i32, .int32, ptr, name, shorthand, default, usage);
+    }
+    pub fn int64VarP(self: *FlagSet, ptr: *i64, name: []const u8, shorthand: u8, default: i64, usage: []const u8) !void {
+        return self.registerNumeric(i64, .int64, ptr, name, shorthand, default, usage);
+    }
+    pub fn uintVarP(self: *FlagSet, ptr: *u64, name: []const u8, shorthand: u8, default: u64, usage: []const u8) !void {
+        return self.registerNumeric(u64, .uint, ptr, name, shorthand, default, usage);
+    }
+    pub fn uint8VarP(self: *FlagSet, ptr: *u8, name: []const u8, shorthand: u8, default: u8, usage: []const u8) !void {
+        return self.registerNumeric(u8, .uint8, ptr, name, shorthand, default, usage);
+    }
+    pub fn uint16VarP(self: *FlagSet, ptr: *u16, name: []const u8, shorthand: u8, default: u16, usage: []const u8) !void {
+        return self.registerNumeric(u16, .uint16, ptr, name, shorthand, default, usage);
+    }
+    pub fn uint32VarP(self: *FlagSet, ptr: *u32, name: []const u8, shorthand: u8, default: u32, usage: []const u8) !void {
+        return self.registerNumeric(u32, .uint32, ptr, name, shorthand, default, usage);
+    }
+    pub fn uint64VarP(self: *FlagSet, ptr: *u64, name: []const u8, shorthand: u8, default: u64, usage: []const u8) !void {
+        return self.registerNumeric(u64, .uint64, ptr, name, shorthand, default, usage);
+    }
+    pub fn float32VarP(self: *FlagSet, ptr: *f32, name: []const u8, shorthand: u8, default: f32, usage: []const u8) !void {
+        return self.registerNumeric(f32, .float32, ptr, name, shorthand, default, usage);
+    }
+    pub fn float64VarP(self: *FlagSet, ptr: *f64, name: []const u8, shorthand: u8, default: f64, usage: []const u8) !void {
+        return self.registerNumeric(f64, .float64, ptr, name, shorthand, default, usage);
+    }
+
+    // ---- lookup ---------------------------------------------------------
+
+    pub fn lookup(self: *const FlagSet, name: []const u8) ?*Flag {
+        return self.formal.get(name);
+    }
+
+    pub fn shorthandLookup(self: *const FlagSet, c: u8) ?*Flag {
+        return self.shorthands[c];
+    }
+
+    // ---- modifiers ------------------------------------------------------
+
+    pub fn markRequired(self: *FlagSet, name: []const u8) error{FlagNotFound}!void {
+        const flag = self.lookup(name) orelse return error.FlagNotFound;
+        flag.required = true;
+    }
+
+    pub fn markHidden(self: *FlagSet, name: []const u8) error{FlagNotFound}!void {
+        const flag = self.lookup(name) orelse return error.FlagNotFound;
+        flag.hidden = true;
+    }
+
+    pub fn markDeprecated(self: *FlagSet, name: []const u8, message: []const u8) error{ FlagNotFound, EmptyDeprecationMessage }!void {
+        if (message.len == 0) return error.EmptyDeprecationMessage;
+        const flag = self.lookup(name) orelse return error.FlagNotFound;
+        flag.deprecated = message;
+        flag.hidden = true; // pflag also auto-hides deprecated flags
+    }
+
+    // ---- set / apply ----------------------------------------------------
+
+    /// Set a flag programmatically by name (mirrors pflag's FlagSet.Set).
+    /// Used by both apply() and external callers.
+    pub fn set(
+        self: *FlagSet,
+        name: []const u8,
+        value: []const u8,
+        diag: ?*Diagnostic,
+    ) errors.FlagError!void {
+        const flag = self.lookup(name) orelse {
+            fillDiag(diag, .flag, .no_such_flag);
+            if (diag) |d| d.flag_name = name;
+            return error.NoSuchFlag;
+        };
+        try setStored(self.allocator, flag, value, diag);
+        flag.changed = true;
+    }
+
+    /// Walk a token stream from the parser and bind every flag/value into
+    /// the user's storage. Returns at the first error (matching pflag's
+    /// "stop on first error" behaviour). Positionals (and passthrough
+    /// tokens after `--`) accumulate into `self.args`.
+    pub fn apply(
+        self: *FlagSet,
+        tokens: []const Token,
+        diag: ?*Diagnostic,
+    ) (errors.ParseError || errors.FlagError || std.mem.Allocator.Error)!void {
+        for (tokens) |tok| switch (tok) {
+            .long => |l| try self.applyLong(l, diag),
+            .short => |s| try self.applyShort(s, diag),
+            .negated => |n| try self.applyNegated(n, diag),
+            .positional => |p| try self.args.append(self.allocator, p.value),
+            .terminator => self.args_len_at_dash = self.args.items.len,
+            .passthrough => |v| try self.args.append(self.allocator, v),
+        };
+    }
+
+    fn applyLong(self: *FlagSet, l: Token.Long, diag: ?*Diagnostic) (errors.ParseError || errors.FlagError || std.mem.Allocator.Error)!void {
+        const flag = self.lookup(l.name) orelse {
+            fillDiag(diag, .parse, .unknown_flag);
+            if (diag) |d| {
+                d.flag_name = l.name;
+                d.raw = l.raw;
+            }
+            return error.UnknownFlag;
+        };
+        const v = l.value orelse blk: {
+            if (flag.no_opt_def_val.len > 0) break :blk flag.no_opt_def_val;
+            fillDiag(diag, .parse, .missing_value);
+            if (diag) |d| {
+                d.flag_name = l.name;
+                d.raw = l.raw;
+            }
+            return error.MissingValue;
+        };
+        try setStored(self.allocator, flag, v, diag);
+        flag.changed = true;
+    }
+
+    fn applyShort(self: *FlagSet, s: Token.Short, diag: ?*Diagnostic) (errors.ParseError || errors.FlagError || std.mem.Allocator.Error)!void {
+        const flag = self.shorthandLookup(s.name) orelse {
+            fillDiag(diag, .parse, .unknown_flag);
+            if (diag) |d| {
+                // Render the single-char name as a length-1 slice borrowed
+                // from the source `raw` (avoid allocating).
+                d.flag_name = findCharSlice(s.raw, s.name);
+                d.raw = s.raw;
+            }
+            return error.UnknownFlag;
+        };
+        const v = s.value orelse blk: {
+            if (flag.no_opt_def_val.len > 0) break :blk flag.no_opt_def_val;
+            fillDiag(diag, .parse, .missing_value);
+            if (diag) |d| {
+                d.flag_name = findCharSlice(s.raw, s.name);
+                d.raw = s.raw;
+            }
+            return error.MissingValue;
+        };
+        try setStored(self.allocator, flag, v, diag);
+        flag.changed = true;
+    }
+
+    fn applyNegated(self: *FlagSet, n: Token.Negated, _: ?*Diagnostic) (errors.ParseError || errors.FlagError || std.mem.Allocator.Error)!void {
+        // Parser only emits `negated` when the schema confirmed it's a
+        // boolean, so we trust the lookup. If the flag has been mutated
+        // since the parser ran, fall back to the unknown-flag path.
+        const flag = self.lookup(n.name) orelse return error.UnknownFlag;
+        try setStored(self.allocator, flag, "false", null);
+        flag.changed = true;
+    }
+
+    // ---- schema view for the parser ------------------------------------
+
+    pub fn flagSchema(self: *const FlagSet) FlagSchema {
+        return .{
+            .ctx = self,
+            .is_value_taking_short = SchemaCallbacks.valueTakingShort,
+            .is_value_taking_long = SchemaCallbacks.valueTakingLong,
+            .is_known_long = SchemaCallbacks.knownLong,
+            .is_boolean_long = SchemaCallbacks.booleanLong,
+        };
+    }
+
+    const SchemaCallbacks = struct {
+        fn valueTakingShort(ctx: *const anyopaque, c: u8) bool {
+            const fs: *const FlagSet = @ptrCast(@alignCast(ctx));
+            const flag = fs.shorthands[c] orelse return false;
+            return flag.no_opt_def_val.len == 0;
+        }
+        fn valueTakingLong(ctx: *const anyopaque, name: []const u8) bool {
+            const fs: *const FlagSet = @ptrCast(@alignCast(ctx));
+            const flag = fs.formal.get(name) orelse return false;
+            return flag.no_opt_def_val.len == 0;
+        }
+        fn knownLong(ctx: *const anyopaque, name: []const u8) bool {
+            const fs: *const FlagSet = @ptrCast(@alignCast(ctx));
+            return fs.formal.contains(name);
+        }
+        fn booleanLong(ctx: *const anyopaque, name: []const u8) bool {
+            const fs: *const FlagSet = @ptrCast(@alignCast(ctx));
+            const flag = fs.formal.get(name) orelse return false;
+            return flag.value_type == .bool;
+        }
+    };
+};
+
+// ---- private helpers -----------------------------------------------------
+
+fn findCharSlice(raw: []const u8, c: u8) []const u8 {
+    const idx = std.mem.indexOfScalar(u8, raw, c) orelse return raw[0..0];
+    return raw[idx .. idx + 1];
+}
+
+/// Coerce `value` according to `flag.value_type` and write through
+/// `flag.value_ptr`. On failure, fills diag with the strconv-style cause
+/// and the flag context.
+fn setStored(
+    allocator: std.mem.Allocator,
+    flag: *Flag,
+    value: []const u8,
+    diag: ?*Diagnostic,
+) errors.FlagError!void {
+    return switch (flag.value_type) {
+        .string => {
+            const p: *[]const u8 = @ptrCast(@alignCast(flag.value_ptr));
+            p.* = value;
+        },
+        .bool => {
+            const b = coerce.parseBool(value) catch return failCoerce(allocator, flag, value, diag, "ParseBool", .invalid_syntax);
+            const p: *bool = @ptrCast(@alignCast(flag.value_ptr));
+            p.* = b;
+        },
+        .int => bindSignedInt(allocator, i64, flag, value, diag, "ParseInt"),
+        .int8 => bindSignedInt(allocator, i8, flag, value, diag, "ParseInt"),
+        .int16 => bindSignedInt(allocator, i16, flag, value, diag, "ParseInt"),
+        .int32 => bindSignedInt(allocator, i32, flag, value, diag, "ParseInt"),
+        .int64 => bindSignedInt(allocator, i64, flag, value, diag, "ParseInt"),
+        .uint => bindUnsignedInt(allocator, u64, flag, value, diag, "ParseUint"),
+        .uint8 => bindUnsignedInt(allocator, u8, flag, value, diag, "ParseUint"),
+        .uint16 => bindUnsignedInt(allocator, u16, flag, value, diag, "ParseUint"),
+        .uint32 => bindUnsignedInt(allocator, u32, flag, value, diag, "ParseUint"),
+        .uint64 => bindUnsignedInt(allocator, u64, flag, value, diag, "ParseUint"),
+        .float32 => bindFloat(allocator, f32, flag, value, diag),
+        .float64 => bindFloat(allocator, f64, flag, value, diag),
+        .count => bindCount(allocator, flag, value, diag),
+        .duration => bindDuration(allocator, flag, value, diag),
+    };
+}
+
+fn bindSignedInt(
+    allocator: std.mem.Allocator,
+    comptime T: type,
+    flag: *Flag,
+    value: []const u8,
+    diag: ?*Diagnostic,
+    func: []const u8,
+) errors.FlagError!void {
+    const v = coerce.parseSignedInt(T, value) catch |err| {
+        return failCoerce(allocator, flag, value, diag, func, coerce.intCause(err));
+    };
+    const p: *T = @ptrCast(@alignCast(flag.value_ptr));
+    p.* = v;
+}
+
+fn bindUnsignedInt(
+    allocator: std.mem.Allocator,
+    comptime T: type,
+    flag: *Flag,
+    value: []const u8,
+    diag: ?*Diagnostic,
+    func: []const u8,
+) errors.FlagError!void {
+    const v = coerce.parseUnsignedInt(T, value) catch |err| {
+        return failCoerce(allocator, flag, value, diag, func, coerce.intCause(err));
+    };
+    const p: *T = @ptrCast(@alignCast(flag.value_ptr));
+    p.* = v;
+}
+
+fn bindFloat(
+    allocator: std.mem.Allocator,
+    comptime T: type,
+    flag: *Flag,
+    value: []const u8,
+    diag: ?*Diagnostic,
+) errors.FlagError!void {
+    const v = coerce.parseFloat(T, value) catch |err| {
+        return failCoerce(allocator, flag, value, diag, "ParseFloat", coerce.floatCause(err));
+    };
+    const p: *T = @ptrCast(@alignCast(flag.value_ptr));
+    p.* = v;
+}
+
+fn bindCount(
+    allocator: std.mem.Allocator,
+    flag: *Flag,
+    value: []const u8,
+    diag: ?*Diagnostic,
+) errors.FlagError!void {
+    const p: *i32 = @ptrCast(@alignCast(flag.value_ptr));
+    if (std.mem.eql(u8, value, "+1")) {
+        // The "+1" sentinel comes from the no_opt_def_val path.
+        p.* +%= 1;
+        return;
+    }
+    // Explicit numeric value (e.g. --verbose=3) overrides the count.
+    const v = coerce.parseSignedInt(i32, value) catch |err| {
+        return failCoerce(allocator, flag, value, diag, "ParseInt", coerce.intCause(err));
+    };
+    p.* = v;
+}
+
+fn bindDuration(
+    allocator: std.mem.Allocator,
+    flag: *Flag,
+    value: []const u8,
+    diag: ?*Diagnostic,
+) errors.FlagError!void {
+    const r = duration.parse(value);
+    switch (r) {
+        .ok => |ns| {
+            const p: *i64 = @ptrCast(@alignCast(flag.value_ptr));
+            p.* = ns;
+        },
+        .err => |e| {
+            const msg = duration.renderError(allocator, e, value) catch return error.TypeCoercionFailed;
+            defer allocator.free(msg);
+            return failCoerceWithRendered(allocator, flag, value, diag, msg);
+        },
+    }
+}
+
+fn failCoerce(
+    allocator: std.mem.Allocator,
+    flag: *Flag,
+    value: []const u8,
+    diag: ?*Diagnostic,
+    func: []const u8,
+    cause: coerce.Cause,
+) errors.FlagError {
+    const cause_msg = coerce.renderNumError(allocator, func, value, cause) catch {
+        return error.TypeCoercionFailed;
+    };
+    defer allocator.free(cause_msg);
+    return failCoerceWithRendered(allocator, flag, value, diag, cause_msg);
+}
+
+fn failCoerceWithRendered(
+    allocator: std.mem.Allocator,
+    flag: *Flag,
+    value: []const u8,
+    diag: ?*Diagnostic,
+    cause_msg: []const u8,
+) errors.FlagError {
+    if (diag) |d| {
+        d.category = .flag;
+        d.code = .type_coercion_failed;
+        d.flag_name = flag.name;
+        d.raw_value = value;
+        // Render the full pflag wording: invalid argument "X" for "--foo" flag: <cause>
+        const rendered = std.fmt.allocPrint(
+            allocator,
+            "invalid argument \"{s}\" for \"--{s}\" flag: {s}",
+            .{ value, flag.name, cause_msg },
+        ) catch return error.TypeCoercionFailed;
+        if (d.owns_message) if (d.message) |m| allocator.free(m);
+        d.message = rendered;
+        d.owns_message = true;
+    }
+    return error.TypeCoercionFailed;
+}
+
+// ---- tests --------------------------------------------------------------
+
+const testing = std.testing;
+
+test "FlagSet: register and lookup string" {
+    const gpa = testing.allocator;
+    var fs = FlagSet.init(gpa);
+    defer fs.deinit();
+
+    var name: []const u8 = "world";
+    try fs.stringVarP(&name, "name", 'n', "world", "who to greet");
+
+    const flag = fs.lookup("name").?;
+    try testing.expectEqualStrings("name", flag.name);
+    try testing.expectEqual(@as(u8, 'n'), flag.shorthand);
+    try testing.expectEqual(ValueType.string, flag.value_type);
+    try testing.expectEqualStrings("world", flag.default_value_string);
+    try testing.expect(fs.shorthandLookup('n') == flag);
+}
+
+test "FlagSet: redefined name errors" {
+    const gpa = testing.allocator;
+    var fs = FlagSet.init(gpa);
+    defer fs.deinit();
+
+    var a: []const u8 = "";
+    try fs.stringVarP(&a, "name", 0, "", "");
+    var b: []const u8 = "";
+    try testing.expectError(error.FlagRedefined, fs.stringVarP(&b, "name", 0, "", ""));
+}
+
+test "FlagSet: redefined shorthand errors" {
+    const gpa = testing.allocator;
+    var fs = FlagSet.init(gpa);
+    defer fs.deinit();
+
+    var a: bool = false;
+    try fs.boolVarP(&a, "alpha", 'a', false, "");
+    var b: bool = false;
+    try testing.expectError(error.ShorthandRedefined, fs.boolVarP(&b, "another", 'a', false, ""));
+}
+
+test "FlagSet: set bool through public api" {
+    const gpa = testing.allocator;
+    var fs = FlagSet.init(gpa);
+    defer fs.deinit();
+
+    var b: bool = false;
+    try fs.boolVarP(&b, "verbose", 'v', false, "");
+    try fs.set("verbose", "true", null);
+    try testing.expect(b);
+    try testing.expect(fs.lookup("verbose").?.changed);
+}
+
+test "FlagSet: int coercion writes through pointer" {
+    const gpa = testing.allocator;
+    var fs = FlagSet.init(gpa);
+    defer fs.deinit();
+
+    var n: i64 = 0;
+    try fs.intVarP(&n, "retries", 'r', 0, "");
+    try fs.set("retries", "42", null);
+    try testing.expectEqual(@as(i64, 42), n);
+    try fs.set("retries", "0664", null); // legacy octal
+    try testing.expectEqual(@as(i64, 0o664), n);
+}
+
+test "FlagSet: int coercion error renders pflag wording" {
+    const gpa = testing.allocator;
+    var fs = FlagSet.init(gpa);
+    defer fs.deinit();
+
+    var n: i64 = 0;
+    try fs.intVarP(&n, "retries", 0, 0, "");
+
+    var diag: Diagnostic = .{};
+    defer diag.deinit(gpa);
+
+    try testing.expectError(error.TypeCoercionFailed, fs.set("retries", "foo", &diag));
+    try testing.expectEqual(Diagnostic.Code.type_coercion_failed, diag.code.?);
+    try testing.expectEqualStrings(
+        "invalid argument \"foo\" for \"--retries\" flag: strconv.ParseInt: parsing \"foo\": invalid syntax",
+        diag.message.?,
+    );
+}
+
+test "FlagSet: count flag increments on +1 sentinel" {
+    const gpa = testing.allocator;
+    var fs = FlagSet.init(gpa);
+    defer fs.deinit();
+
+    var v: i32 = 0;
+    try fs.countVarP(&v, "verbose", 'v', "");
+    try fs.set("verbose", "+1", null);
+    try fs.set("verbose", "+1", null);
+    try fs.set("verbose", "+1", null);
+    try testing.expectEqual(@as(i32, 3), v);
+
+    // Explicit numeric value overrides.
+    try fs.set("verbose", "10", null);
+    try testing.expectEqual(@as(i32, 10), v);
+}
+
+test "FlagSet: duration parses and stores ns" {
+    const gpa = testing.allocator;
+    var fs = FlagSet.init(gpa);
+    defer fs.deinit();
+
+    var d: i64 = 0;
+    try fs.durationVarP(&d, "timeout", 't', 0, "");
+    try fs.set("timeout", "300ms", null);
+    try testing.expectEqual(@as(i64, 300_000_000), d);
+    try fs.set("timeout", "2h45m", null);
+    try testing.expectEqual(@as(i64, 9_900_000_000_000), d);
+}
+
+test "FlagSet: duration error renders Go time-package wording" {
+    const gpa = testing.allocator;
+    var fs = FlagSet.init(gpa);
+    defer fs.deinit();
+
+    var d: i64 = 0;
+    try fs.durationVarP(&d, "timeout", 0, 0, "");
+
+    var diag: Diagnostic = .{};
+    defer diag.deinit(gpa);
+
+    try testing.expectError(error.TypeCoercionFailed, fs.set("timeout", "5x", &diag));
+    try testing.expectEqualStrings(
+        "invalid argument \"5x\" for \"--timeout\" flag: time: unknown unit \"x\" in duration \"5x\"",
+        diag.message.?,
+    );
+}
+
+test "FlagSet: markRequired / markHidden / markDeprecated" {
+    const gpa = testing.allocator;
+    var fs = FlagSet.init(gpa);
+    defer fs.deinit();
+
+    var s: []const u8 = "";
+    try fs.stringVarP(&s, "input", 0, "", "");
+    try fs.markRequired("input");
+    try testing.expect(fs.lookup("input").?.required);
+
+    try fs.stringVarP(&s, "secret", 0, "", "");
+    try fs.markHidden("secret");
+    try testing.expect(fs.lookup("secret").?.hidden);
+
+    try fs.stringVarP(&s, "old", 0, "", "");
+    try fs.markDeprecated("old", "use --new instead");
+    try testing.expectEqualStrings("use --new instead", fs.lookup("old").?.deprecated);
+    try testing.expect(fs.lookup("old").?.hidden); // pflag auto-hides deprecated
+
+    try testing.expectError(error.FlagNotFound, fs.markRequired("nonexistent"));
+    try testing.expectError(error.EmptyDeprecationMessage, fs.markDeprecated("input", ""));
+}
+
+test "FlagSet: apply binds tokens from parser" {
+    const gpa = testing.allocator;
+    const parse = @import("../parser/parser.zig").parse;
+    var fs = FlagSet.init(gpa);
+    defer fs.deinit();
+
+    var name: []const u8 = "world";
+    var verbose: i32 = 0;
+    var dry_run: bool = false;
+    var retries: i64 = 0;
+
+    try fs.stringVarP(&name, "name", 'n', "world", "");
+    try fs.countVarP(&verbose, "verbose", 'v', "");
+    try fs.boolVarP(&dry_run, "dry-run", 'd', false, "");
+    try fs.intVarP(&retries, "retries", 'r', 0, "");
+
+    const tokens = try parse(gpa, &.{ "--name=alice", "-vvv", "-d", "--retries", "5", "leftover" }, fs.flagSchema(), null);
+    defer gpa.free(tokens);
+
+    try fs.apply(tokens, null);
+
+    try testing.expectEqualStrings("alice", name);
+    try testing.expectEqual(@as(i32, 3), verbose);
+    try testing.expect(dry_run);
+    try testing.expectEqual(@as(i64, 5), retries);
+    try testing.expectEqual(@as(usize, 1), fs.args.items.len);
+    try testing.expectEqualStrings("leftover", fs.args.items[0]);
+}
+
+test "FlagSet: --no-foo binds boolean to false" {
+    const gpa = testing.allocator;
+    const parse = @import("../parser/parser.zig").parse;
+    var fs = FlagSet.init(gpa);
+    defer fs.deinit();
+
+    var dry_run: bool = true;
+    try fs.boolVarP(&dry_run, "dry-run", 'd', true, "");
+
+    const tokens = try parse(gpa, &.{"--no-dry-run"}, fs.flagSchema(), null);
+    defer gpa.free(tokens);
+    try fs.apply(tokens, null);
+    try testing.expect(!dry_run);
+}
+
+test "FlagSet: terminator records argsLenAtDash" {
+    const gpa = testing.allocator;
+    const parse = @import("../parser/parser.zig").parse;
+    var fs = FlagSet.init(gpa);
+    defer fs.deinit();
+
+    const tokens = try parse(gpa, &.{ "a", "b", "--", "c", "d" }, fs.flagSchema(), null);
+    defer gpa.free(tokens);
+    try fs.apply(tokens, null);
+
+    try testing.expectEqual(@as(?usize, 2), fs.args_len_at_dash);
+    try testing.expectEqual(@as(usize, 4), fs.args.items.len);
+    try testing.expectEqualStrings("a", fs.args.items[0]);
+    try testing.expectEqualStrings("b", fs.args.items[1]);
+    try testing.expectEqualStrings("c", fs.args.items[2]);
+    try testing.expectEqualStrings("d", fs.args.items[3]);
+}
+
+test "FlagSet: unknown flag fills diagnostic" {
+    const gpa = testing.allocator;
+    const parse = @import("../parser/parser.zig").parse;
+    var fs = FlagSet.init(gpa);
+    defer fs.deinit();
+
+    const tokens = try parse(gpa, &.{"--unknown"}, fs.flagSchema(), null);
+    defer gpa.free(tokens);
+
+    var diag: Diagnostic = .{};
+    defer diag.deinit(gpa);
+    try testing.expectError(error.UnknownFlag, fs.apply(tokens, &diag));
+    try testing.expectEqualStrings("unknown", diag.flag_name.?);
+    try testing.expectEqualStrings("--unknown", diag.raw.?);
+}
+
+test "FlagSet: missing value fills diagnostic" {
+    const gpa = testing.allocator;
+    const parse = @import("../parser/parser.zig").parse;
+    var fs = FlagSet.init(gpa);
+    defer fs.deinit();
+
+    var n: i64 = 0;
+    try fs.intVarP(&n, "retries", 0, 0, "");
+
+    // --retries with no following arg, value-taking.
+    const tokens = try parse(gpa, &.{"--retries"}, fs.flagSchema(), null);
+    defer gpa.free(tokens);
+
+    var diag: Diagnostic = .{};
+    defer diag.deinit(gpa);
+    try testing.expectError(error.MissingValue, fs.apply(tokens, &diag));
+    try testing.expectEqualStrings("retries", diag.flag_name.?);
+}
