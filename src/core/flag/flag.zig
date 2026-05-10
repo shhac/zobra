@@ -894,11 +894,6 @@ pub const FlagSet = struct {
 
 // ---- private helpers -----------------------------------------------------
 
-fn findCharSlice(raw: []const u8, c: u8) []const u8 {
-    const idx = std.mem.indexOfScalar(u8, raw, c) orelse return raw[0..0];
-    return raw[idx .. idx + 1];
-}
-
 /// Type of a flag-lookup callback. Used by `applyTokensWith` so the same
 /// dispatch loop can drive both `FlagSet.apply` (own-flags lookup) and
 /// `Command.applyTokens` (own + inherited persistent lookup).

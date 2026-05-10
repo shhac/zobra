@@ -134,7 +134,7 @@ fn renderLine(allocator: std.mem.Allocator, flag: *const Flag) !RenderedLine {
     defer tail_aw.deinit();
     const tw = &tail_aw.writer;
     try tw.writeAll(unquoted.usage);
-    if (!defaultIsZeroValue(flag)) {
+    if (!flag.isZeroDefault()) {
         if (flag.value_type == .string) {
             try tw.print(" (default \"{s}\")", .{flag.default_value_string});
         } else {
@@ -215,12 +215,6 @@ pub fn typeDisplayName(t: ValueType) []const u8 {
     };
 }
 
-/// Mirror of pflag.defaultIsZeroValue. Delegates to `Flag.isZeroDefault`
-/// so help, markdown, yaml, rest, and man stay in lockstep on the
-/// zero-default-detection logic.
-pub fn defaultIsZeroValue(flag: *const Flag) bool {
-    return flag.isZeroDefault();
-}
 
 // ---- tests --------------------------------------------------------------
 
@@ -285,20 +279,20 @@ test "typeDisplayName: pflag-style normalisation" {
     try testing.expectEqualStrings("", typeDisplayName(.bool));
 }
 
-test "defaultIsZeroValue: type-aware" {
+test "Flag.isZeroDefault: type-aware (via help renderer's caller)" {
     const gpa = testing.allocator;
     var fs = FlagSet.init(gpa);
     defer fs.deinit();
 
     var s: []const u8 = "";
     try fs.stringVarP(&s, "empty", 0, "", "");
-    try testing.expect(defaultIsZeroValue(fs.lookup("empty").?));
+    try testing.expect(fs.lookup("empty").?.isZeroDefault());
 
     var b: bool = false;
     try fs.boolVarP(&b, "off", 0, false, "");
-    try testing.expect(defaultIsZeroValue(fs.lookup("off").?));
+    try testing.expect(fs.lookup("off").?.isZeroDefault());
 
     var n: i64 = 5;
     try fs.intVarP(&n, "five", 0, 5, "");
-    try testing.expect(!defaultIsZeroValue(fs.lookup("five").?));
+    try testing.expect(!fs.lookup("five").?.isZeroDefault());
 }
