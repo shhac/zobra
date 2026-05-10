@@ -210,23 +210,9 @@ pub const Command = struct {
         return cmd;
     }
 
-    /// Lazy --help / -h registration. Called at the start of execute on
     // Lazy auto-init for the cobra-default `--help` flag, `--version`
-    // flag, and `help [command]` subcommand now lives in defaults.zig.
-    // The methods below are thin pass-throughs so existing call sites
-    // (`self.initDefaultHelpFlag()` etc.) keep working.
-
-    fn initDefaultHelpFlag(self: *Command) !void {
-        return defaults_mod.initHelpFlag(self);
-    }
-
-    fn initDefaultHelpCommand(self: *Command) !void {
-        return defaults_mod.initHelpCommand(self);
-    }
-
-    fn initDefaultVersionFlag(self: *Command) !void {
-        return defaults_mod.initVersionFlag(self);
-    }
+    // flag, and `help [command]` subcommand lives in `defaults.zig`.
+    // The `executeWith` path calls `defaults_mod.init*` directly.
 
     /// Recursively frees this command's children, both flag sets, the
     /// children list, and the Command itself.
@@ -604,7 +590,7 @@ pub const Command = struct {
 
         // Register the lazy `help [command]` subcommand BEFORE
         // findCommand so the help-path resolves correctly.
-        try self.initDefaultHelpCommand();
+        try defaults_mod.initHelpCommand(self);
 
         const found = self.findCommand(allocator, argv, diag) catch |err| {
             if (diag) |d| try renderParseDiag(allocator, d);
@@ -614,8 +600,8 @@ pub const Command = struct {
         const cmd = found.cmd;
         const sub_argv = found.remaining;
 
-        try cmd.initDefaultHelpFlag();
-        try cmd.initDefaultVersionFlag();
+        try defaults_mod.initHelpFlag(cmd);
+        try defaults_mod.initVersionFlag(cmd);
 
         if (cmd.disable_flag_parsing) return cmd.runDisabledFlagParsing(sub_argv, opts);
 
