@@ -126,6 +126,62 @@ test "Command: silence_usage suppresses the usage block" {
     try testing.expect(std.mem.indexOf(u8, out, "Usage:") == null);
 }
 
+test "Command: help subcommand resolves and prints child help" {
+    const gpa = testing.allocator;
+    var out_aw: std.Io.Writer.Allocating = .init(gpa);
+    defer out_aw.deinit();
+
+    const root = try Command.init(gpa, .{ .use = "tool" });
+    defer root.deinit();
+    root.setOut(&out_aw.writer);
+
+    const greet = try Command.init(gpa, .{
+        .use = "greet",
+        .short = "Print a greeting",
+        .run_e = noopRun,
+    });
+    try root.addCommand(greet);
+
+    // `tool help greet` → prints greet's help.
+    try root.executeAndPrint(&.{ "help", "greet" });
+    const out = out_aw.writer.buffered();
+    try testing.expect(std.mem.indexOf(u8, out, "Print a greeting") != null);
+    // help renders the full command path: "tool greet"
+    try testing.expect(std.mem.indexOf(u8, out, "tool greet") != null);
+}
+
+test "Command: help subcommand on unknown topic prints miss wording" {
+    const gpa = testing.allocator;
+    var out_aw: std.Io.Writer.Allocating = .init(gpa);
+    defer out_aw.deinit();
+
+    const root = try Command.init(gpa, .{ .use = "tool" });
+    defer root.deinit();
+    root.setOut(&out_aw.writer);
+    try root.addCommand(try Command.init(gpa, .{ .use = "greet", .run_e = noopRun }));
+
+    try root.executeAndPrint(&.{ "help", "no-such-cmd" });
+    try testing.expect(std.mem.indexOf(u8, out_aw.writer.buffered(), "Unknown help topic [`no-such-cmd`]") != null);
+}
+
+test "Command: setHelpFunc overrides the rendered help" {
+    const gpa = testing.allocator;
+    const Override = struct {
+        fn helpFn(_: *const Command, w: *std.Io.Writer) anyerror!void {
+            try w.writeAll("CUSTOM HELP\n");
+        }
+    };
+
+    const cmd = try Command.init(gpa, .{ .use = "tool", .run_e = noopRun });
+    defer cmd.deinit();
+    cmd.setHelpFunc(Override.helpFn);
+
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try cmd.executeWith(&.{"--help"}, .{ .out_writer = &aw.writer });
+    try testing.expectEqualStrings("CUSTOM HELP\n", aw.writer.buffered());
+}
+
 test "Command: setOut/setErr inherit from parent" {
     const gpa = testing.allocator;
     var err_aw: std.Io.Writer.Allocating = .init(gpa);

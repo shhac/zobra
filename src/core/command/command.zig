@@ -127,6 +127,18 @@ pub const Command = struct {
     out_writer: ?*std.Io.Writer,
     err_writer: ?*std.Io.Writer,
 
+    /// Optional override for help / usage rendering. When set, replaces
+    /// the procedural composer in src/core/help/help.zig. Mirrors
+    /// cobra's SetHelpFunc / SetUsageFunc (function-form, not the Go
+    /// text/template form which we don't ship).
+    help_fn: ?*const fn (cmd: *const Command, w: *std.Io.Writer) anyerror!void,
+    usage_fn: ?*const fn (cmd: *const Command, w: *std.Io.Writer) anyerror!void,
+
+    /// Marker: the auto-injected `help` subcommand that lazy-registers
+    /// at executeAndPrint time. Tracked so we don't re-register and so
+    /// the auto-help command doesn't recurse if a user manually adds one.
+    help_subcommand_initialised: bool,
+
     /// Storage for the auto-injected --help flag's value. Per-command;
     /// cobra calls this lazily in execute (`InitDefaultHelpFlag`). We do
     /// the same in `execute()`. False until the user passes --help / -h.
@@ -184,6 +196,9 @@ pub const Command = struct {
             .context = null,
             .out_writer = null,
             .err_writer = null,
+            .help_fn = null,
+            .usage_fn = null,
+            .help_subcommand_initialised = false,
             .help_flag_value = false,
             .help_flag_initialised = false,
             .version_flag_value = false,
@@ -220,6 +235,49 @@ pub const Command = struct {
         try self.flags_set.boolVarP(&self.help_flag_value, "help", shorthand, false, owned_msg);
 
         self.help_flag_initialised = true;
+    }
+
+    /// Lazy `help [path]` subcommand registration on root. Cobra's
+    /// AddDefaultHelpCmd: a real `help` Command that, when run with
+    /// argv `[path...]`, finds the target sub-command and prints its
+    /// help block. Skips installation when the root has no children
+    /// (no help-path makes sense at a leaf) or when the user already
+    /// registered a child named `help`.
+    fn initDefaultHelpCommand(self: *Command) !void {
+        if (self.help_subcommand_initialised) return;
+        self.help_subcommand_initialised = true;
+        if (self.children.items.len == 0) return;
+        if (self.findChildByNameOrAlias("help") != null) return;
+
+        const help_cmd = try Command.init(self.allocator, .{
+            .use = "help [command]",
+            .short = "Help about any command",
+            .long = "Help provides help for any command in the application.",
+            .run_e = helpCommandRun,
+        });
+        try self.addCommand(help_cmd);
+    }
+
+    /// Run handler for the auto-injected `help` subcommand. cmd here is
+    /// the help-command itself; its parent is the root we want to walk.
+    fn helpCommandRun(cmd: *Command, args: []const []const u8) anyerror!void {
+        const root = cmd.parent orelse return;
+        const allocator = cmd.allocator;
+        const w = root.outWriter() orelse return;
+
+        if (args.len == 0) {
+            return root.printHelp(allocator, w);
+        }
+        // findCommand on root with the help-path args. If it resolves
+        // to root itself (no match), print cobra's miss wording.
+        const found = try root.findCommand(allocator, args, null);
+        defer allocator.free(found.remaining);
+        if (found.cmd == root and args.len > 0) {
+            try w.print("Unknown help topic [`{s}`]\n", .{args[0]});
+            try root.printHelp(allocator, w);
+            return;
+        }
+        try found.cmd.printHelp(allocator, w);
     }
 
     /// Lazy --version registration (only when Command.version is non-empty).
@@ -268,17 +326,30 @@ pub const Command = struct {
 
     /// Render this command's help block into an owned slice. Caller frees.
     pub fn helpString(self: *const Command, allocator: Allocator) ![]u8 {
+        if (self.help_fn) |fn_ptr| {
+            var aw: std.Io.Writer.Allocating = .init(allocator);
+            defer aw.deinit();
+            try fn_ptr(self, &aw.writer);
+            return aw.toOwnedSlice();
+        }
         return help_mod.helpString(allocator, self);
     }
 
     /// Render the usage block (no Long description) into an owned slice.
     pub fn usageString(self: *const Command, allocator: Allocator) ![]u8 {
+        if (self.usage_fn) |fn_ptr| {
+            var aw: std.Io.Writer.Allocating = .init(allocator);
+            defer aw.deinit();
+            try fn_ptr(self, &aw.writer);
+            return aw.toOwnedSlice();
+        }
         return help_mod.usageString(allocator, self);
     }
 
     /// Render help straight to the writer.
     pub fn printHelp(self: *const Command, allocator: Allocator, writer: *std.Io.Writer) !void {
-        const text = try self.helpString(allocator);
+        if (self.help_fn) |fn_ptr| return fn_ptr(self, writer);
+        const text = try help_mod.helpString(allocator, self);
         defer allocator.free(text);
         try writer.writeAll(text);
     }
@@ -326,6 +397,17 @@ pub const Command = struct {
             if (c.err_writer) |w| return w;
         }
         return null;
+    }
+
+    /// cobra's Command.SetHelpFunc — install a function-form help
+    /// renderer that overrides the default composer. The fn receives
+    /// the command being help'd and a writer to drive.
+    pub fn setHelpFunc(self: *Command, fn_ptr: *const fn (cmd: *const Command, w: *std.Io.Writer) anyerror!void) void {
+        self.help_fn = fn_ptr;
+    }
+
+    pub fn setUsageFunc(self: *Command, fn_ptr: *const fn (cmd: *const Command, w: *std.Io.Writer) anyerror!void) void {
+        self.usage_fn = fn_ptr;
     }
 
     pub const AddCommandError = error{
@@ -597,6 +679,10 @@ pub const Command = struct {
     pub fn executeWith(self: *Command, argv: []const []const u8, opts: ExecuteOptions) !void {
         const allocator = self.allocator;
         const diag = opts.diag;
+
+        // Register the lazy `help [command]` subcommand BEFORE
+        // findCommand so the help-path resolves correctly.
+        try self.initDefaultHelpCommand();
 
         const found = self.findCommand(allocator, argv, diag) catch |err| {
             if (diag) |d| try renderParseDiag(allocator, d);
