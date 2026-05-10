@@ -55,6 +55,11 @@ pub const ValueType = enum {
     string_to_string, // *std.StringHashMapUnmanaged([]const u8)
     string_to_int, // *std.StringHashMapUnmanaged(i32)
     string_to_int64, // *std.StringHashMapUnmanaged(i64)
+    ip, // *[]const u8 — IPv4 or IPv6 literal (validated)
+    ip_mask, // *[]const u8 — hex IP mask
+    ip_net, // *[]const u8 — CIDR (e.g. 192.168.1.0/24)
+    bytes_hex, // *[]const u8 — decoded bytes (FlagSet-owned)
+    bytes_base64, // *[]const u8 — decoded bytes (FlagSet-owned)
 
     pub fn isBoolean(self: ValueType) bool {
         return self == .bool;
@@ -477,6 +482,118 @@ pub const FlagSet = struct {
         try self.registerMapLike(.string_to_int64, @ptrCast(ptr), name, shorthand, usage);
     }
 
+    pub fn ipVarP(
+        self: *FlagSet,
+        ptr: *[]const u8,
+        name: []const u8,
+        shorthand: u8,
+        default: []const u8,
+        usage: []const u8,
+    ) !void {
+        try self.registerStringFlag(.ip, ptr, name, shorthand, default, usage);
+    }
+
+    pub fn ipMaskVarP(
+        self: *FlagSet,
+        ptr: *[]const u8,
+        name: []const u8,
+        shorthand: u8,
+        default: []const u8,
+        usage: []const u8,
+    ) !void {
+        try self.registerStringFlag(.ip_mask, ptr, name, shorthand, default, usage);
+    }
+
+    pub fn ipNetVarP(
+        self: *FlagSet,
+        ptr: *[]const u8,
+        name: []const u8,
+        shorthand: u8,
+        default: []const u8,
+        usage: []const u8,
+    ) !void {
+        try self.registerStringFlag(.ip_net, ptr, name, shorthand, default, usage);
+    }
+
+    pub fn bytesHexVarP(
+        self: *FlagSet,
+        ptr: *[]const u8,
+        name: []const u8,
+        shorthand: u8,
+        default: []const u8,
+        usage: []const u8,
+    ) !void {
+        try self.registerBytesFlag(.bytes_hex, ptr, name, shorthand, default, usage);
+    }
+
+    pub fn bytesBase64VarP(
+        self: *FlagSet,
+        ptr: *[]const u8,
+        name: []const u8,
+        shorthand: u8,
+        default: []const u8,
+        usage: []const u8,
+    ) !void {
+        try self.registerBytesFlag(.bytes_base64, ptr, name, shorthand, default, usage);
+    }
+
+    /// Register an "IP-shape" flag — stores the validated input string
+    /// directly (borrowed from argv). No allocation.
+    fn registerStringFlag(
+        self: *FlagSet,
+        comptime tag: ValueType,
+        ptr: *[]const u8,
+        name: []const u8,
+        shorthand: u8,
+        default: []const u8,
+        usage: []const u8,
+    ) !void {
+        ptr.* = default;
+        _ = try self.addFlag(.{
+            .name = name,
+            .shorthand = shorthand,
+            .usage = usage,
+            .value_type = tag,
+            .value_ptr = @ptrCast(ptr),
+            .default_value_string = default,
+            .owns_default = false,
+            .owns_value_storage = false,
+            .no_opt_def_val = "",
+        });
+    }
+
+    /// Register a "bytes" flag — stores the DECODED bytes as owned
+    /// storage; deinit frees it. Default value is treated as an
+    /// already-decoded byte slice (typical use: `&.{}`).
+    fn registerBytesFlag(
+        self: *FlagSet,
+        comptime tag: ValueType,
+        ptr: *[]const u8,
+        name: []const u8,
+        shorthand: u8,
+        default: []const u8,
+        usage: []const u8,
+    ) !void {
+        const owned = try self.allocator.dupe(u8, default);
+        errdefer self.allocator.free(owned);
+
+        const ds = try self.allocator.dupe(u8, "[]");
+        errdefer self.allocator.free(ds);
+
+        _ = try self.addFlag(.{
+            .name = name,
+            .shorthand = shorthand,
+            .usage = usage,
+            .value_type = tag,
+            .value_ptr = @ptrCast(ptr),
+            .default_value_string = ds,
+            .owns_default = true,
+            .owns_value_storage = true,
+            .no_opt_def_val = "",
+        });
+        ptr.* = owned;
+    }
+
     fn registerMapLike(
         self: *FlagSet,
         comptime tag: ValueType,
@@ -826,7 +943,130 @@ fn setStored(
         .string_to_string => bindStringToString(allocator, flag, value, diag),
         .string_to_int => bindStringToInt(allocator, i32, flag, value, diag, "ParseInt"),
         .string_to_int64 => bindStringToInt(allocator, i64, flag, value, diag, "ParseInt"),
+        .ip => bindIp(allocator, flag, value, diag),
+        .ip_mask => bindIpMask(allocator, flag, value, diag),
+        .ip_net => bindIpNet(allocator, flag, value, diag),
+        .bytes_hex => bindBytesHex(allocator, flag, value, diag),
+        .bytes_base64 => bindBytesBase64(allocator, flag, value, diag),
     };
+}
+
+fn bindIp(
+    allocator: std.mem.Allocator,
+    flag: *Flag,
+    value: []const u8,
+    diag: ?*Diagnostic,
+) (errors.FlagError || std.mem.Allocator.Error)!void {
+    // Validate using std.Io.net.IpAddress.parse (no port).
+    _ = std.Io.net.IpAddress.parse(value, 0) catch {
+        const cause = std.fmt.allocPrint(allocator, "invalid IP address: {s}", .{value}) catch return error.TypeCoercionFailed;
+        defer allocator.free(cause);
+        return failCoerceWithRendered(allocator, flag, value, diag, cause);
+    };
+    const p: *[]const u8 = @ptrCast(@alignCast(flag.value_ptr));
+    p.* = value;
+}
+
+fn bindIpMask(
+    allocator: std.mem.Allocator,
+    flag: *Flag,
+    value: []const u8,
+    diag: ?*Diagnostic,
+) (errors.FlagError || std.mem.Allocator.Error)!void {
+    // pflag accepts hex (8 chars for IPv4 mask, 32 for IPv6) or dotted-
+    // decimal. Minimum validation: 8 or 32 hex chars. Dotted-decimal is
+    // a follow-up if a fixture forces it.
+    const valid_len = value.len == 8 or value.len == 32;
+    var all_hex = true;
+    for (value) |c| {
+        const is_hex = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
+        if (!is_hex) {
+            all_hex = false;
+            break;
+        }
+    }
+    if (!(valid_len and all_hex)) {
+        const cause = std.fmt.allocPrint(allocator, "invalid IP mask: {s}", .{value}) catch return error.TypeCoercionFailed;
+        defer allocator.free(cause);
+        return failCoerceWithRendered(allocator, flag, value, diag, cause);
+    }
+    const p: *[]const u8 = @ptrCast(@alignCast(flag.value_ptr));
+    p.* = value;
+}
+
+fn bindIpNet(
+    allocator: std.mem.Allocator,
+    flag: *Flag,
+    value: []const u8,
+    diag: ?*Diagnostic,
+) (errors.FlagError || std.mem.Allocator.Error)!void {
+    // CIDR: ip/prefix-length. Split on '/', validate IP + prefix.
+    const slash = std.mem.indexOfScalar(u8, value, '/') orelse {
+        const cause = std.fmt.allocPrint(allocator, "invalid CIDR address: {s}", .{value}) catch return error.TypeCoercionFailed;
+        defer allocator.free(cause);
+        return failCoerceWithRendered(allocator, flag, value, diag, cause);
+    };
+    const ip_part = value[0..slash];
+    const prefix_part = value[slash + 1 ..];
+    _ = std.Io.net.IpAddress.parse(ip_part, 0) catch {
+        const cause = std.fmt.allocPrint(allocator, "invalid CIDR address: {s}", .{value}) catch return error.TypeCoercionFailed;
+        defer allocator.free(cause);
+        return failCoerceWithRendered(allocator, flag, value, diag, cause);
+    };
+    _ = std.fmt.parseInt(u8, prefix_part, 10) catch {
+        const cause = std.fmt.allocPrint(allocator, "invalid CIDR address: {s}", .{value}) catch return error.TypeCoercionFailed;
+        defer allocator.free(cause);
+        return failCoerceWithRendered(allocator, flag, value, diag, cause);
+    };
+    const p: *[]const u8 = @ptrCast(@alignCast(flag.value_ptr));
+    p.* = value;
+}
+
+fn bindBytesHex(
+    allocator: std.mem.Allocator,
+    flag: *Flag,
+    value: []const u8,
+    diag: ?*Diagnostic,
+) (errors.FlagError || std.mem.Allocator.Error)!void {
+    if (value.len % 2 != 0) {
+        const cause = std.fmt.allocPrint(allocator, "encoding/hex: odd length hex string", .{}) catch return error.TypeCoercionFailed;
+        defer allocator.free(cause);
+        return failCoerceWithRendered(allocator, flag, value, diag, cause);
+    }
+    const out = try allocator.alloc(u8, value.len / 2);
+    errdefer allocator.free(out);
+    _ = std.fmt.hexToBytes(out, value) catch {
+        const cause = std.fmt.allocPrint(allocator, "encoding/hex: invalid byte: {s}", .{value}) catch return error.TypeCoercionFailed;
+        defer allocator.free(cause);
+        return failCoerceWithRendered(allocator, flag, value, diag, cause);
+    };
+    const p: *[]const u8 = @ptrCast(@alignCast(flag.value_ptr));
+    if (flag.owns_value_storage) allocator.free(p.*);
+    p.* = out;
+}
+
+fn bindBytesBase64(
+    allocator: std.mem.Allocator,
+    flag: *Flag,
+    value: []const u8,
+    diag: ?*Diagnostic,
+) (errors.FlagError || std.mem.Allocator.Error)!void {
+    const decoder = std.base64.standard.Decoder;
+    const decoded_len = decoder.calcSizeForSlice(value) catch {
+        const cause = std.fmt.allocPrint(allocator, "illegal base64 data: {s}", .{value}) catch return error.TypeCoercionFailed;
+        defer allocator.free(cause);
+        return failCoerceWithRendered(allocator, flag, value, diag, cause);
+    };
+    const out = try allocator.alloc(u8, decoded_len);
+    errdefer allocator.free(out);
+    decoder.decode(out, value) catch {
+        const cause = std.fmt.allocPrint(allocator, "illegal base64 data: {s}", .{value}) catch return error.TypeCoercionFailed;
+        defer allocator.free(cause);
+        return failCoerceWithRendered(allocator, flag, value, diag, cause);
+    };
+    const p: *[]const u8 = @ptrCast(@alignCast(flag.value_ptr));
+    if (flag.owns_value_storage) allocator.free(p.*);
+    p.* = out;
 }
 
 fn bindStringToString(
@@ -1085,6 +1325,10 @@ fn freeSliceStorage(allocator: std.mem.Allocator, flag: *Flag) void {
         },
         .bool_slice => {
             const p: *[]const bool = @ptrCast(@alignCast(flag.value_ptr));
+            allocator.free(p.*);
+        },
+        .bytes_hex, .bytes_base64 => {
+            const p: *[]const u8 = @ptrCast(@alignCast(flag.value_ptr));
             allocator.free(p.*);
         },
         else => {},
