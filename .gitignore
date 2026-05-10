@@ -1,0 +1,30 @@
+# macOS
+.DS_Store
+
+# Zig build outputs
+.zig-cache/
+zig-cache/
+zig-out/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Local-only working files
+.cache
+.tmp
+.ai-cache
+
+# Go oracle build artefacts (binary is gitignored; fixtures are committed)
+oracle/bin/
+oracle/cobra-oracle
+
+# Logs
+*.log
+
+# Claude local config
+.claude/*.local.json
+CLAUDE.local.md
