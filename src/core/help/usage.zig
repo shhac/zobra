@@ -177,6 +177,9 @@ pub fn typeDisplayName(t: ValueType) []const u8 {
         .float64 => "float", // pflag normalises float64 → "float"
         .count => "count",
         .duration => "duration",
+        .string_slice => "strings", // pflag's stringSlice → "strings"
+        .string_array => "stringArray",
+        .int_slice => "ints",
     };
 }
 
@@ -187,6 +190,7 @@ pub fn defaultIsZeroValue(flag: *const Flag) bool {
         .duration => std.mem.eql(u8, flag.default_value_string, "0") or std.mem.eql(u8, flag.default_value_string, "0s"),
         .int, .int8, .int16, .int32, .int64, .uint, .uint8, .uint16, .uint32, .uint64, .count, .float32, .float64 => std.mem.eql(u8, flag.default_value_string, "0"),
         .string => flag.default_value_string.len == 0,
+        .string_slice, .string_array, .int_slice => std.mem.eql(u8, flag.default_value_string, "[]"),
     };
 }
 

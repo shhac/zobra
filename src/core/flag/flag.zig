@@ -24,8 +24,8 @@ const Token = @import("../parser/token.zig").Token;
 
 pub const FlagSchema = parser_mod.FlagSchema;
 
-/// All scalar value types zobra's *VarP methods bind. The CustomFlag
-/// vtable (Phase 5c) will land as another variant.
+/// All scalar + slice value types zobra's *VarP methods bind. The
+/// CustomFlag vtable (Phase 5c) will land as another variant.
 pub const ValueType = enum {
     string,
     bool,
@@ -43,6 +43,9 @@ pub const ValueType = enum {
     float64,
     count, // *i32 — increments on each occurrence; matches pflag's count
     duration, // *i64 — nanoseconds, matches Go's time.Duration
+    string_slice, // *[]const []const u8 — CSV-split, append-on-repeat
+    string_array, // *[]const []const u8 — no split, append-on-repeat
+    int_slice, // *[]const i64 — decimal only (pflag uses Atoi)
 
     pub fn isBoolean(self: ValueType) bool {
         return self == .bool;
@@ -50,6 +53,10 @@ pub const ValueType = enum {
 
     pub fn isCount(self: ValueType) bool {
         return self == .count;
+    }
+
+    pub fn isSliceLike(self: ValueType) bool {
+        return self == .string_slice or self == .string_array or self == .int_slice;
     }
 };
 
@@ -71,6 +78,9 @@ pub const Flag = struct {
     deprecated: []const u8,
     /// Whether the FlagSet owns `default_value_string` and should free it.
     owns_default: bool,
+    /// For slice / map types: the FlagSet owns the slice/map storage that
+    /// `value_ptr` points at, and frees it on deinit.
+    owns_value_storage: bool,
 };
 
 pub const FlagSet = struct {
@@ -98,6 +108,7 @@ pub const FlagSet = struct {
     pub fn deinit(self: *FlagSet) void {
         for (self.ordered.items) |flag| {
             if (flag.owns_default) self.allocator.free(flag.default_value_string);
+            if (flag.owns_value_storage) freeSliceStorage(self.allocator, flag);
             self.allocator.destroy(flag);
         }
         self.formal.deinit(self.allocator);
@@ -123,6 +134,7 @@ pub const FlagSet = struct {
             value_ptr: *anyopaque,
             default_value_string: []const u8,
             owns_default: bool,
+            owns_value_storage: bool = false,
             no_opt_def_val: []const u8,
         },
     ) RegisterError!*Flag {
@@ -141,6 +153,7 @@ pub const FlagSet = struct {
             .value_ptr = spec.value_ptr,
             .default_value_string = spec.default_value_string,
             .owns_default = spec.owns_default,
+            .owns_value_storage = spec.owns_value_storage,
             .no_opt_def_val = spec.no_opt_def_val,
             .changed = false,
             .hidden = false,
@@ -316,6 +329,71 @@ pub const FlagSet = struct {
         return self.registerNumeric(f64, .float64, ptr, name, shorthand, default, usage);
     }
 
+    pub fn stringSliceVarP(
+        self: *FlagSet,
+        ptr: *[]const []const u8,
+        name: []const u8,
+        shorthand: u8,
+        default: []const []const u8,
+        usage: []const u8,
+    ) !void {
+        try self.registerSliceLike([]const u8, .string_slice, ptr, name, shorthand, default, usage);
+    }
+
+    pub fn stringArrayVarP(
+        self: *FlagSet,
+        ptr: *[]const []const u8,
+        name: []const u8,
+        shorthand: u8,
+        default: []const []const u8,
+        usage: []const u8,
+    ) !void {
+        try self.registerSliceLike([]const u8, .string_array, ptr, name, shorthand, default, usage);
+    }
+
+    pub fn intSliceVarP(
+        self: *FlagSet,
+        ptr: *[]const i64,
+        name: []const u8,
+        shorthand: u8,
+        default: []const i64,
+        usage: []const u8,
+    ) !void {
+        try self.registerSliceLike(i64, .int_slice, ptr, name, shorthand, default, usage);
+    }
+
+    fn registerSliceLike(
+        self: *FlagSet,
+        comptime Elem: type,
+        comptime tag: ValueType,
+        ptr: *[]const Elem,
+        name: []const u8,
+        shorthand: u8,
+        default: []const Elem,
+        usage: []const u8,
+    ) !void {
+        // Copy the user's default into FlagSet-owned storage so the user
+        // doesn't need to manage its lifetime (they typically pass `&.{}`
+        // or a literal; both go out of scope before the FlagSet does).
+        const owned = try self.allocator.dupe(Elem, default);
+        ptr.* = owned;
+
+        const ds = try renderSliceDefault(Elem, self.allocator, default);
+        errdefer self.allocator.free(ds);
+
+        _ = try self.addFlag(.{
+            .name = name,
+            .shorthand = shorthand,
+            .usage = usage,
+            .value_type = tag,
+            .value_ptr = @ptrCast(ptr),
+            .default_value_string = ds,
+            .owns_default = true,
+            .owns_value_storage = true,
+            .no_opt_def_val = "",
+        });
+    }
+
     // ---- lookup ---------------------------------------------------------
 
     pub fn lookup(self: *const FlagSet, name: []const u8) ?*Flag {
@@ -354,7 +432,7 @@ pub const FlagSet = struct {
         name: []const u8,
         value: []const u8,
         diag: ?*Diagnostic,
-    ) errors.FlagError!void {
+    ) (errors.FlagError || std.mem.Allocator.Error)!void {
         const flag = self.lookup(name) orelse {
             fillDiag(diag, .flag, .no_such_flag);
             if (diag) |d| d.flag_name = name;
@@ -488,7 +566,7 @@ pub fn setStoredExternal(
     flag: *Flag,
     value: []const u8,
     diag: ?*Diagnostic,
-) errors.FlagError!void {
+) (errors.FlagError || std.mem.Allocator.Error)!void {
     return setStored(allocator, flag, value, diag);
 }
 
@@ -500,7 +578,7 @@ fn setStored(
     flag: *Flag,
     value: []const u8,
     diag: ?*Diagnostic,
-) errors.FlagError!void {
+) (errors.FlagError || std.mem.Allocator.Error)!void {
     return switch (flag.value_type) {
         .string => {
             const p: *[]const u8 = @ptrCast(@alignCast(flag.value_ptr));
@@ -525,7 +603,120 @@ fn setStored(
         .float64 => bindFloat(allocator, f64, flag, value, diag),
         .count => bindCount(allocator, flag, value, diag),
         .duration => bindDuration(allocator, flag, value, diag),
+        .string_slice => bindStringSlice(allocator, flag, value, diag),
+        .string_array => bindStringArray(allocator, flag, value, diag),
+        .int_slice => bindIntSlice(allocator, flag, value, diag),
     };
+}
+
+fn bindStringSlice(
+    allocator: std.mem.Allocator,
+    flag: *Flag,
+    value: []const u8,
+    diag: ?*Diagnostic,
+) (errors.FlagError || std.mem.Allocator.Error)!void {
+    _ = diag;
+    // Comma-split (no CSV quoting yet — defer until a fixture forces it).
+    const ptr: *[]const []const u8 = @ptrCast(@alignCast(flag.value_ptr));
+    const old = ptr.*;
+    var pieces: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer pieces.deinit(allocator);
+
+    if (flag.changed) {
+        try pieces.appendSlice(allocator, old);
+    }
+
+    if (value.len > 0) {
+        var it = std.mem.splitScalar(u8, value, ',');
+        while (it.next()) |s| try pieces.append(allocator, s);
+    } else if (!flag.changed) {
+        // pflag's readAsCSV("") returns []. Mirror.
+    }
+
+    const owned = try pieces.toOwnedSlice(allocator);
+    if (flag.changed) allocator.free(old);
+    ptr.* = owned;
+}
+
+fn bindStringArray(
+    allocator: std.mem.Allocator,
+    flag: *Flag,
+    value: []const u8,
+    diag: ?*Diagnostic,
+) (errors.FlagError || std.mem.Allocator.Error)!void {
+    _ = diag;
+    const ptr: *[]const []const u8 = @ptrCast(@alignCast(flag.value_ptr));
+    const old = ptr.*;
+    const new_len = if (flag.changed) old.len + 1 else 1;
+    const owned = try allocator.alloc([]const u8, new_len);
+    if (flag.changed) {
+        std.mem.copyForwards([]const u8, owned[0..old.len], old);
+        owned[old.len] = value;
+        allocator.free(old);
+    } else {
+        owned[0] = value;
+    }
+    ptr.* = owned;
+}
+
+fn bindIntSlice(
+    allocator: std.mem.Allocator,
+    flag: *Flag,
+    value: []const u8,
+    diag: ?*Diagnostic,
+) (errors.FlagError || std.mem.Allocator.Error)!void {
+    // pflag's intSlice uses Atoi (decimal only). We reuse parseSignedInt
+    // with i64 (matching IntVar's width) — which accepts hex/octal too,
+    // a minor divergence; documented in 09 if a fixture surfaces it.
+    var pieces: std.ArrayListUnmanaged(i64) = .empty;
+    defer pieces.deinit(allocator);
+
+    const ptr: *[]const i64 = @ptrCast(@alignCast(flag.value_ptr));
+    if (flag.changed) try pieces.appendSlice(allocator, ptr.*);
+
+    var it = std.mem.splitScalar(u8, value, ',');
+    while (it.next()) |s| {
+        const n = coerce.parseSignedInt(i64, s) catch |err| {
+            return failCoerce(allocator, flag, s, diag, "Atoi", coerce.intCause(err));
+        };
+        try pieces.append(allocator, n);
+    }
+
+    const owned = try pieces.toOwnedSlice(allocator);
+    if (flag.changed) allocator.free(ptr.*);
+    ptr.* = owned;
+}
+
+fn freeSliceStorage(allocator: std.mem.Allocator, flag: *Flag) void {
+    switch (flag.value_type) {
+        .string_slice, .string_array => {
+            const p: *[]const []const u8 = @ptrCast(@alignCast(flag.value_ptr));
+            allocator.free(p.*);
+        },
+        .int_slice => {
+            const p: *[]const i64 = @ptrCast(@alignCast(flag.value_ptr));
+            allocator.free(p.*);
+        },
+        else => {},
+    }
+}
+
+fn renderSliceDefault(comptime Elem: type, allocator: std.mem.Allocator, slice: []const Elem) ![]u8 {
+    if (slice.len == 0) return allocator.dupe(u8, "[]");
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    const w = &aw.writer;
+    try w.writeByte('[');
+    for (slice, 0..) |item, i| {
+        if (i > 0) try w.writeByte(',');
+        if (Elem == []const u8) {
+            try w.writeAll(item);
+        } else {
+            try w.print("{d}", .{item});
+        }
+    }
+    try w.writeByte(']');
+    return aw.toOwnedSlice();
 }
 
 fn bindSignedInt(
@@ -884,6 +1075,70 @@ test "FlagSet: unknown flag fills diagnostic" {
     try testing.expectError(error.UnknownFlag, fs.apply(tokens, &diag));
     try testing.expectEqualStrings("unknown", diag.flag_name.?);
     try testing.expectEqualStrings("--unknown", diag.raw.?);
+}
+
+test "FlagSet: stringSlice splits on comma and appends on repeat" {
+    const gpa = testing.allocator;
+    var fs = FlagSet.init(gpa);
+    defer fs.deinit();
+
+    var tags: []const []const u8 = &.{};
+    try fs.stringSliceVarP(&tags, "tag", 't', &.{}, "");
+
+    try fs.set("tag", "a,b,c", null);
+    try testing.expectEqual(@as(usize, 3), tags.len);
+    try testing.expectEqualStrings("a", tags[0]);
+    try testing.expectEqualStrings("b", tags[1]);
+    try testing.expectEqualStrings("c", tags[2]);
+
+    try fs.set("tag", "d,e", null);
+    try testing.expectEqual(@as(usize, 5), tags.len);
+    try testing.expectEqualStrings("e", tags[4]);
+}
+
+test "FlagSet: stringArray does not split on comma" {
+    const gpa = testing.allocator;
+    var fs = FlagSet.init(gpa);
+    defer fs.deinit();
+
+    var labels: []const []const u8 = &.{};
+    try fs.stringArrayVarP(&labels, "label", 0, &.{}, "");
+
+    try fs.set("label", "a,b", null);
+    try testing.expectEqual(@as(usize, 1), labels.len);
+    try testing.expectEqualStrings("a,b", labels[0]);
+
+    try fs.set("label", "c", null);
+    try testing.expectEqual(@as(usize, 2), labels.len);
+    try testing.expectEqualStrings("c", labels[1]);
+}
+
+test "FlagSet: intSlice parses + appends" {
+    const gpa = testing.allocator;
+    var fs = FlagSet.init(gpa);
+    defer fs.deinit();
+
+    var nums: []const i64 = &.{};
+    try fs.intSliceVarP(&nums, "ints", 0, &.{}, "");
+
+    try fs.set("ints", "1,2,3", null);
+    try testing.expectEqualSlices(i64, &.{ 1, 2, 3 }, nums);
+    try fs.set("ints", "4", null);
+    try testing.expectEqualSlices(i64, &.{ 1, 2, 3, 4 }, nums);
+}
+
+test "FlagSet: intSlice with non-numeric fails with strconv wording" {
+    const gpa = testing.allocator;
+    var fs = FlagSet.init(gpa);
+    defer fs.deinit();
+
+    var nums: []const i64 = &.{};
+    try fs.intSliceVarP(&nums, "ints", 0, &.{}, "");
+
+    var diag: Diagnostic = .{};
+    defer diag.deinit(gpa);
+    try testing.expectError(error.TypeCoercionFailed, fs.set("ints", "1,foo,3", &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message.?, "strconv.Atoi: parsing \"foo\": invalid syntax") != null);
 }
 
 test "FlagSet: missing value fills diagnostic" {

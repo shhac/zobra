@@ -85,6 +85,13 @@ pub const Command = struct {
     flags_set: FlagSet,
     persistent_flags_set: FlagSet,
 
+    /// Flag groups, validated post-apply. Each group is a list of flag
+    /// names; the list slice itself is owned by the Command (duped on
+    /// registration), but each name inside is borrowed from the caller.
+    required_together_groups: std.ArrayListUnmanaged([]const []const u8),
+    one_required_groups: std.ArrayListUnmanaged([]const []const u8),
+    mutex_groups: std.ArrayListUnmanaged([]const []const u8),
+
     /// Caller-bindable context pointer (analogue to cobra's SetContext).
     /// Used by hooks to retrieve user state. Borrow-only; the user owns
     /// whatever it points to.
@@ -131,6 +138,9 @@ pub const Command = struct {
             .children = .empty,
             .flags_set = FlagSet.init(allocator),
             .persistent_flags_set = FlagSet.init(allocator),
+            .required_together_groups = .empty,
+            .one_required_groups = .empty,
+            .mutex_groups = .empty,
             .context = null,
             .help_flag_value = false,
             .help_flag_initialised = false,
@@ -172,6 +182,12 @@ pub const Command = struct {
         self.children.deinit(self.allocator);
         for (self.help_owned_strings.items) |s| self.allocator.free(s);
         self.help_owned_strings.deinit(self.allocator);
+        for (self.required_together_groups.items) |g| self.allocator.free(g);
+        self.required_together_groups.deinit(self.allocator);
+        for (self.one_required_groups.items) |g| self.allocator.free(g);
+        self.one_required_groups.deinit(self.allocator);
+        for (self.mutex_groups.items) |g| self.allocator.free(g);
+        self.mutex_groups.deinit(self.allocator);
         self.flags_set.deinit();
         self.persistent_flags_set.deinit();
         self.allocator.destroy(self);
@@ -214,6 +230,37 @@ pub const Command = struct {
     pub fn addCommand(self: *Command, child: *Command) !void {
         try self.children.append(self.allocator, child);
         child.parent = self;
+    }
+
+    /// Mark a set of flags as required-together. cobra raises an error if
+    /// the user passes some but not all of them.
+    pub fn markFlagsRequiredTogether(self: *Command, names: []const []const u8) !void {
+        try self.assertAllRegistered(names);
+        const dup = try self.allocator.dupe([]const u8, names);
+        errdefer self.allocator.free(dup);
+        try self.required_together_groups.append(self.allocator, dup);
+    }
+
+    /// Mark a set of flags so that at least one must be set.
+    pub fn markFlagsOneRequired(self: *Command, names: []const []const u8) !void {
+        try self.assertAllRegistered(names);
+        const dup = try self.allocator.dupe([]const u8, names);
+        errdefer self.allocator.free(dup);
+        try self.one_required_groups.append(self.allocator, dup);
+    }
+
+    /// Mark a set of flags as mutually exclusive — at most one may be set.
+    pub fn markFlagsMutuallyExclusive(self: *Command, names: []const []const u8) !void {
+        try self.assertAllRegistered(names);
+        const dup = try self.allocator.dupe([]const u8, names);
+        errdefer self.allocator.free(dup);
+        try self.mutex_groups.append(self.allocator, dup);
+    }
+
+    fn assertAllRegistered(self: *const Command, names: []const []const u8) error{FlagNotFound}!void {
+        for (names) |n| {
+            if (self.lookupLong(n) == null) return error.FlagNotFound;
+        }
     }
 
     pub fn markFlagRequired(self: *Command, name: []const u8) !void {
@@ -415,8 +462,79 @@ pub const Command = struct {
         }
 
         try cmd.validateRequiredFlags(diag);
+        try cmd.validateFlagGroups(diag);
 
         try hook_mod.run(Command, cmd, positionals, false);
+    }
+
+    fn validateFlagGroups(self: *const Command, diag: ?*Diagnostic) errors.FlagError!void {
+        try self.validateRequiredTogether(diag);
+        try self.validateOneRequired(diag);
+        try self.validateMutex(diag);
+    }
+
+    fn flagChanged(self: *const Command, name: []const u8) bool {
+        const f = self.lookupLong(name) orelse return false;
+        return f.changed;
+    }
+
+    fn validateRequiredTogether(self: *const Command, diag: ?*Diagnostic) errors.FlagError!void {
+        for (self.required_together_groups.items) |group| {
+            var unset: std.ArrayListUnmanaged([]const u8) = .empty;
+            defer unset.deinit(self.allocator);
+            var set_count: usize = 0;
+            for (group) |name| {
+                if (self.flagChanged(name)) {
+                    set_count += 1;
+                } else {
+                    unset.append(self.allocator, name) catch return error.FlagGroupViolation;
+                }
+            }
+            if (set_count == 0 or unset.items.len == 0) continue;
+            return failGroup(
+                self.allocator,
+                diag,
+                "if any flags in the group [{group}] are set they must all be set; missing [{names}]",
+                group,
+                unset.items,
+            );
+        }
+    }
+
+    fn validateOneRequired(self: *const Command, diag: ?*Diagnostic) errors.FlagError!void {
+        for (self.one_required_groups.items) |group| {
+            var any_set = false;
+            for (group) |name| if (self.flagChanged(name)) {
+                any_set = true;
+                break;
+            };
+            if (any_set) continue;
+            return failGroup(
+                self.allocator,
+                diag,
+                "at least one of the flags in the group [{group}] is required",
+                group,
+                &.{},
+            );
+        }
+    }
+
+    fn validateMutex(self: *const Command, diag: ?*Diagnostic) errors.FlagError!void {
+        for (self.mutex_groups.items) |group| {
+            var set: std.ArrayListUnmanaged([]const u8) = .empty;
+            defer set.deinit(self.allocator);
+            for (group) |name| if (self.flagChanged(name)) {
+                set.append(self.allocator, name) catch return error.FlagGroupViolation;
+            };
+            if (set.items.len <= 1) continue;
+            return failGroup(
+                self.allocator,
+                diag,
+                "if any flags in the group [{group}] are set none of the others can be; [{names}] were all set",
+                group,
+                set.items,
+            );
+        }
     }
 
     fn applyTokens(
@@ -509,6 +627,77 @@ pub const Command = struct {
 
 // ---- private helpers ----------------------------------------------------
 
+/// Render a flag-group violation message and stash it on the diagnostic.
+/// Format mirrors cobra's `[a b c]` (space-separated, square-bracketed).
+fn failGroup(
+    allocator: Allocator,
+    diag: ?*Diagnostic,
+    template: []const u8,
+    group: []const []const u8,
+    names: []const []const u8,
+) errors.FlagError {
+    const group_str = joinSpaceSeparated(allocator, group) catch return error.FlagGroupViolation;
+    defer allocator.free(group_str);
+    const names_str = joinSpaceSeparated(allocator, names) catch return error.FlagGroupViolation;
+    defer allocator.free(names_str);
+
+    const rendered = renderTemplate(allocator, template, group_str, names_str) catch return error.FlagGroupViolation;
+
+    if (diag) |d| {
+        d.category = .flag;
+        d.code = .flag_group_violation;
+        if (d.owns_message) if (d.message) |m| allocator.free(m);
+        d.message = rendered;
+        d.owns_message = true;
+    } else {
+        allocator.free(rendered);
+    }
+    return error.FlagGroupViolation;
+}
+
+fn joinSpaceSeparated(allocator: Allocator, names: []const []const u8) ![]u8 {
+    if (names.len == 0) return allocator.dupe(u8, "");
+
+    // Sort for deterministic output (cobra also sorts).
+    const sorted = try allocator.dupe([]const u8, names);
+    defer allocator.free(sorted);
+    std.mem.sort([]const u8, sorted, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    const w = &aw.writer;
+    for (sorted, 0..) |n, i| {
+        if (i > 0) try w.writeByte(' ');
+        try w.writeAll(n);
+    }
+    return aw.toOwnedSlice();
+}
+
+fn renderTemplate(allocator: Allocator, template: []const u8, group: []const u8, names: []const u8) ![]u8 {
+    // Tiny one-pass replace of {group} and {names}.
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    const w = &aw.writer;
+    var i: usize = 0;
+    while (i < template.len) {
+        if (i + 7 <= template.len and std.mem.eql(u8, template[i .. i + 7], "{group}")) {
+            try w.writeAll(group);
+            i += 7;
+        } else if (i + 7 <= template.len and std.mem.eql(u8, template[i .. i + 7], "{names}")) {
+            try w.writeAll(names);
+            i += 7;
+        } else {
+            try w.writeByte(template[i]);
+            i += 1;
+        }
+    }
+    return aw.toOwnedSlice();
+}
+
 fn findCharSlice(raw: []const u8, c: u8) []const u8 {
     const idx = std.mem.indexOfScalar(u8, raw, c) orelse return raw[0..0];
     return raw[idx .. idx + 1];
@@ -522,7 +711,7 @@ fn setStored(
     flag: *flag_mod.Flag,
     value: []const u8,
     diag: ?*Diagnostic,
-) errors.FlagError!void {
+) (errors.FlagError || std.mem.Allocator.Error)!void {
     return flag_mod.setStoredExternal(allocator, flag, value, diag);
 }
 
@@ -705,6 +894,77 @@ test "Command: -h shorthand triggers help" {
     defer aw.deinit();
     try root.executeWith(&.{"-h"}, .{ .out_writer = &aw.writer });
     try testing.expect(std.mem.indexOf(u8, aw.writer.buffered(), "Usage:") != null);
+}
+
+test "Command: markFlagsMutuallyExclusive errors if both set" {
+    const gpa = testing.allocator;
+    const root = try Command.init(gpa, .{ .use = "tool", .run_e = noopRun });
+    defer root.deinit();
+
+    var a: bool = false;
+    var b: bool = false;
+    try root.flags().boolVarP(&a, "json", 0, false, "");
+    try root.flags().boolVarP(&b, "yaml", 0, false, "");
+    try root.markFlagsMutuallyExclusive(&.{ "json", "yaml" });
+
+    var diag: Diagnostic = .{};
+    defer diag.deinit(gpa);
+    try testing.expectError(error.FlagGroupViolation, root.execute(&.{ "--json", "--yaml" }, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message.?, "if any flags in the group [json yaml] are set none of the others can be") != null);
+
+    // Setting just one is fine.
+    var a2: bool = false;
+    var b2: bool = false;
+    const root2 = try Command.init(gpa, .{ .use = "tool", .run_e = noopRun });
+    defer root2.deinit();
+    try root2.flags().boolVarP(&a2, "json", 0, false, "");
+    try root2.flags().boolVarP(&b2, "yaml", 0, false, "");
+    try root2.markFlagsMutuallyExclusive(&.{ "json", "yaml" });
+    try root2.execute(&.{"--json"}, null);
+}
+
+test "Command: markFlagsRequiredTogether errors on partial set" {
+    const gpa = testing.allocator;
+    const root = try Command.init(gpa, .{ .use = "tool", .run_e = noopRun });
+    defer root.deinit();
+
+    var u: []const u8 = "";
+    var p: []const u8 = "";
+    try root.flags().stringVarP(&u, "user", 0, "", "");
+    try root.flags().stringVarP(&p, "password", 0, "", "");
+    try root.markFlagsRequiredTogether(&.{ "user", "password" });
+
+    var diag: Diagnostic = .{};
+    defer diag.deinit(gpa);
+    try testing.expectError(error.FlagGroupViolation, root.execute(&.{ "--user", "alice" }, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message.?, "if any flags in the group [password user] are set they must all be set; missing [password]") != null);
+
+    // Both set is fine.
+    const root2 = try Command.init(gpa, .{ .use = "tool", .run_e = noopRun });
+    defer root2.deinit();
+    var user2: []const u8 = "";
+    var pass2: []const u8 = "";
+    try root2.flags().stringVarP(&user2, "user", 0, "", "");
+    try root2.flags().stringVarP(&pass2, "password", 0, "", "");
+    try root2.markFlagsRequiredTogether(&.{ "user", "password" });
+    try root2.execute(&.{ "--user", "alice", "--password", "secret" }, null);
+}
+
+test "Command: markFlagsOneRequired errors when none set" {
+    const gpa = testing.allocator;
+    const root = try Command.init(gpa, .{ .use = "tool", .run_e = noopRun });
+    defer root.deinit();
+
+    var a: bool = false;
+    var b: bool = false;
+    try root.flags().boolVarP(&a, "json", 0, false, "");
+    try root.flags().boolVarP(&b, "yaml", 0, false, "");
+    try root.markFlagsOneRequired(&.{ "json", "yaml" });
+
+    var diag: Diagnostic = .{};
+    defer diag.deinit(gpa);
+    try testing.expectError(error.FlagGroupViolation, root.execute(&.{}, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message.?, "at least one of the flags in the group [json yaml] is required") != null);
 }
 
 test "Command: command without run prints help even without --help" {
