@@ -131,6 +131,7 @@ fn toUpper(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
 
 pub fn genManTree(
     allocator: std.mem.Allocator,
+    io: std.Io,
     cmd: *const Command,
     header: ManHeader,
     dir: []const u8,
@@ -138,7 +139,7 @@ pub fn genManTree(
     for (cmd.children.items) |c| {
         if (!util.isAvailableCommand(c)) continue;
         if (util.isAdditionalHelpTopicCommand(c)) continue;
-        try genManTree(allocator, c, header, dir);
+        try genManTree(allocator, io, c, header, dir);
     }
     const path = try cmd.commandPathString(allocator);
     defer allocator.free(path);
@@ -151,10 +152,10 @@ pub fn genManTree(
     defer allocator.free(filename_base);
     const full = try std.fs.path.join(allocator, &.{ dir, filename_base });
     defer allocator.free(full);
-    const file = try std.fs.cwd().createFile(full, .{});
-    defer file.close();
+    var file = try std.Io.Dir.cwd().createFile(io, full, .{});
+    defer file.close(io);
     var buf: [4096]u8 = undefined;
-    var fw = file.writer(&buf);
+    var fw: std.Io.File.Writer = .init(file, io, &buf);
     try genMan(allocator, cmd, header, &fw.interface);
     try fw.interface.flush();
 }

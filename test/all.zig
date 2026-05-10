@@ -18,6 +18,7 @@ test {
     _ = @import("coverage/duration_boundary.zig");
     _ = @import("coverage/medium.zig");
     _ = @import("completion/scripts.zig");
+    _ = @import("doc/tree.zig");
 }
 
 test "scaffold: zobra module imports cleanly" {

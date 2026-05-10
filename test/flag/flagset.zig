@@ -311,6 +311,78 @@ test "FlagSet: intSlice with non-numeric fails with strconv wording" {
     try testing.expect(std.mem.indexOf(u8, diag.message.?, "strconv.Atoi: parsing \"foo\": invalid syntax") != null);
 }
 
+test "Flag.isZeroDefault: covers every ValueType variant" {
+    const gpa = std.testing.allocator;
+    var fs = zobra.flag.FlagSet.init(gpa);
+    defer fs.deinit();
+
+    var b: bool = false;
+    var s: []const u8 = "";
+    var i: i64 = 0;
+    var u: u64 = 0;
+    var f: f64 = 0;
+    var c: i32 = 0;
+    var d: i64 = 0;
+    try fs.boolVarP(&b, "z_bool", 0, false, "");
+    try fs.stringVarP(&s, "z_string", 0, "", "");
+    try fs.intVarP(&i, "z_int", 0, 0, "");
+    try fs.uintVarP(&u, "z_uint", 0, 0, "");
+    try fs.float64VarP(&f, "z_float", 0, 0, "");
+    try fs.countVarP(&c, "z_count", 0, "");
+    try fs.durationVarP(&d, "z_dur", 0, 0, "");
+
+    try std.testing.expect(fs.lookup("z_bool").?.isZeroDefault());
+    try std.testing.expect(fs.lookup("z_string").?.isZeroDefault());
+    try std.testing.expect(fs.lookup("z_int").?.isZeroDefault());
+    try std.testing.expect(fs.lookup("z_uint").?.isZeroDefault());
+    try std.testing.expect(fs.lookup("z_float").?.isZeroDefault());
+    try std.testing.expect(fs.lookup("z_count").?.isZeroDefault());
+    try std.testing.expect(fs.lookup("z_dur").?.isZeroDefault());
+
+    var b2: bool = true;
+    var nzi: i64 = 5;
+    var s2: []const u8 = "hi";
+    try fs.boolVarP(&b2, "nz_bool", 0, true, "");
+    try fs.intVarP(&nzi, "nz_int", 0, 5, "");
+    try fs.stringVarP(&s2, "nz_string", 0, "hi", "");
+
+    try std.testing.expect(!fs.lookup("nz_bool").?.isZeroDefault());
+    try std.testing.expect(!fs.lookup("nz_int").?.isZeroDefault());
+    try std.testing.expect(!fs.lookup("nz_string").?.isZeroDefault());
+
+    var ss: []const []const u8 = &.{};
+    try fs.stringSliceVarP(&ss, "z_strs", 0, &.{}, "");
+    try std.testing.expect(fs.lookup("z_strs").?.isZeroDefault());
+}
+
+test "Flag.typeName: cobra-style display names" {
+    const gpa = std.testing.allocator;
+    var fs = zobra.flag.FlagSet.init(gpa);
+    defer fs.deinit();
+    var b: bool = false;
+    var s: []const u8 = "";
+    var i64v: i64 = 0;
+    var i32v: i32 = 0;
+    var f: f64 = 0;
+    var c: i32 = 0;
+    var d: i64 = 0;
+    try fs.boolVarP(&b, "b", 0, false, "");
+    try fs.stringVarP(&s, "s", 0, "", "");
+    try fs.intVarP(&i64v, "int", 0, 0, "");
+    try fs.int32VarP(&i32v, "i32", 0, 0, "");
+    try fs.float64VarP(&f, "f", 0, 0, "");
+    try fs.countVarP(&c, "cnt", 0, "");
+    try fs.durationVarP(&d, "dur", 0, 0, "");
+
+    try std.testing.expectEqualStrings("", fs.lookup("b").?.typeName());
+    try std.testing.expectEqualStrings("string", fs.lookup("s").?.typeName());
+    try std.testing.expectEqualStrings("int", fs.lookup("int").?.typeName());
+    try std.testing.expectEqualStrings("int32", fs.lookup("i32").?.typeName());
+    try std.testing.expectEqualStrings("float", fs.lookup("f").?.typeName());
+    try std.testing.expectEqualStrings("count", fs.lookup("cnt").?.typeName());
+    try std.testing.expectEqualStrings("duration", fs.lookup("dur").?.typeName());
+}
+
 test "FlagSet: missing value fills diagnostic" {
     const gpa = testing.allocator;
     var fs = FlagSet.init(gpa);

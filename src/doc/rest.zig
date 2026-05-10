@@ -133,19 +133,20 @@ fn renderFlagsAsLiteralBlock(allocator: std.mem.Allocator, sets: []const *const 
 
 pub fn genReSTTree(
     allocator: std.mem.Allocator,
+    io: std.Io,
     cmd: *const Command,
     dir: []const u8,
 ) !void {
     for (cmd.children.items) |c| {
         if (!util.isAvailableCommand(c)) continue;
         if (util.isAdditionalHelpTopicCommand(c)) continue;
-        try genReSTTree(allocator, c, dir);
+        try genReSTTree(allocator, io, c, dir);
     }
     const path = try cmd.commandPathString(allocator);
     defer allocator.free(path);
     const path_u = try util.underscoreSpaces(allocator, path);
     defer allocator.free(path_u);
-    try util.writeToFile(allocator, dir, path_u, rst_extension, cmd, genReST);
+    try util.writeToFile(allocator, io, dir, path_u, rst_extension, cmd, genReST);
 }
 
 const testing = std.testing;

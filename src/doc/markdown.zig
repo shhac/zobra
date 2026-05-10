@@ -254,13 +254,15 @@ fn renderTail(allocator: std.mem.Allocator, flag: *const zobra.flag.Flag) ![]u8 
 /// Walk the command tree and write one markdown file per non-hidden,
 /// non-help-topic command into `dir`. Files are named by replacing
 /// spaces in the command path with underscores and appending `.md`.
-/// (cobra's GenMarkdownTree).
+/// (cobra's GenMarkdownTree). `io` is Zig 0.16's explicit-IO context;
+/// pass `init.io` from your `main`.
 pub fn genMarkdownTree(
     allocator: std.mem.Allocator,
+    io: std.Io,
     cmd: *const Command,
     dir: []const u8,
 ) !void {
-    return genMarkdownTreeCustom(allocator, cmd, dir, emptyPrepender, identityLink);
+    return genMarkdownTreeCustom(allocator, io, cmd, dir, emptyPrepender, identityLink);
 }
 
 fn emptyPrepender(allocator: std.mem.Allocator, _: []const u8) anyerror![]u8 {
@@ -269,6 +271,7 @@ fn emptyPrepender(allocator: std.mem.Allocator, _: []const u8) anyerror![]u8 {
 
 pub fn genMarkdownTreeCustom(
     allocator: std.mem.Allocator,
+    io: std.Io,
     cmd: *const Command,
     dir: []const u8,
     file_prepender: *const fn (std.mem.Allocator, []const u8) anyerror![]u8,
@@ -277,7 +280,7 @@ pub fn genMarkdownTreeCustom(
     for (cmd.children.items) |c| {
         if (!util.isAvailableCommand(c)) continue;
         if (util.isAdditionalHelpTopicCommand(c)) continue;
-        try genMarkdownTreeCustom(allocator, c, dir, file_prepender, link_handler);
+        try genMarkdownTreeCustom(allocator, io, c, dir, file_prepender, link_handler);
     }
 
     const path = try cmd.commandPathString(allocator);
@@ -289,11 +292,11 @@ pub fn genMarkdownTreeCustom(
     const filename = try std.fs.path.join(allocator, &.{ dir, basename });
     defer allocator.free(filename);
 
-    var file = try std.fs.cwd().createFile(filename, .{});
-    defer file.close();
+    var file = try std.Io.Dir.cwd().createFile(io, filename, .{});
+    defer file.close(io);
 
     var buf: [4096]u8 = undefined;
-    var fw = file.writer(&buf);
+    var fw: std.Io.File.Writer = .init(file, io, &buf);
     const w = &fw.interface;
 
     const prepend = try file_prepender(allocator, filename);

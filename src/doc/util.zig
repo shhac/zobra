@@ -145,9 +145,12 @@ pub fn docEligibleChildren(allocator: std.mem.Allocator, cmd: *const Command) ![
 /// Open `<dir>/<basename><ext>` for write, hand a buffered `*std.Io.Writer`
 /// to `gen_fn`, then flush. Centralises the boilerplate that lived
 /// verbatim in each `genXxxTree` function. Caller supplies the
-/// per-format extension (including the leading `.`).
+/// per-format extension (including the leading `.`) and the `io`
+/// context (Zig 0.16's explicit-IO requirement — pass `init.io` from
+/// `pub fn main(init: std.process.Init)`).
 pub fn writeToFile(
     allocator: std.mem.Allocator,
+    io: std.Io,
     dir: []const u8,
     basename: []const u8,
     ext: []const u8,
@@ -159,10 +162,10 @@ pub fn writeToFile(
     const full_path = try std.fs.path.join(allocator, &.{ dir, filename });
     defer allocator.free(full_path);
 
-    const file = try std.fs.cwd().createFile(full_path, .{});
-    defer file.close();
+    var file = try std.Io.Dir.cwd().createFile(io, full_path, .{});
+    defer file.close(io);
     var buf: [4096]u8 = undefined;
-    var fw = file.writer(&buf);
+    var fw: std.Io.File.Writer = .init(file, io, &buf);
     try gen_fn(allocator, cmd, &fw.interface);
     try fw.interface.flush();
 }

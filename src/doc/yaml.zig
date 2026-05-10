@@ -92,19 +92,20 @@ fn writeYamlFlagsBlock(
 
 pub fn genYamlTree(
     allocator: std.mem.Allocator,
+    io: std.Io,
     cmd: *const Command,
     dir: []const u8,
 ) !void {
     for (cmd.children.items) |c| {
         if (!util.isAvailableCommand(c)) continue;
         if (util.isAdditionalHelpTopicCommand(c)) continue;
-        try genYamlTree(allocator, c, dir);
+        try genYamlTree(allocator, io, c, dir);
     }
     const path = try cmd.commandPathString(allocator);
     defer allocator.free(path);
     const path_u = try util.underscoreSpaces(allocator, path);
     defer allocator.free(path_u);
-    try util.writeToFile(allocator, dir, path_u, ".yaml", cmd, genYaml);
+    try util.writeToFile(allocator, io, dir, path_u, ".yaml", cmd, genYaml);
 }
 
 const testing = std.testing;
