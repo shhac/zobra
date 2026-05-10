@@ -372,8 +372,12 @@ pub const FlagSet = struct {
         // Copy the user's default into FlagSet-owned storage so the user
         // doesn't need to manage its lifetime (they typically pass `&.{}`
         // or a literal; both go out of scope before the FlagSet does).
+        // Order matters: we don't write `ptr.*` until addFlag has
+        // succeeded, so a mid-OOM failure leaves the user's pointer
+        // pointing at its original (untouched) value. The errdefers
+        // free the FlagSet-allocated storage on any early return.
         const owned = try self.allocator.dupe(Elem, default);
-        ptr.* = owned;
+        errdefer self.allocator.free(owned);
 
         const ds = try renderSliceDefault(Elem, self.allocator, default);
         errdefer self.allocator.free(ds);
@@ -389,6 +393,10 @@ pub const FlagSet = struct {
             .owns_value_storage = true,
             .no_opt_def_val = "",
         });
+
+        // addFlag succeeded — FlagSet owns owned + ds via the
+        // owns_value_storage / owns_default flags. Commit the binding.
+        ptr.* = owned;
     }
 
     // ---- lookup ---------------------------------------------------------

@@ -9,6 +9,10 @@ test {
     _ = @import("command/command.zig");
     _ = @import("command/multi_level.zig");
     _ = @import("flag/flagset.zig");
+    _ = @import("coverage/oom.zig");
+    _ = @import("coverage/wording.zig");
+    _ = @import("coverage/duration_boundary.zig");
+    _ = @import("coverage/medium.zig");
 }
 
 test "scaffold: zobra module imports cleanly" {

@@ -29,6 +29,8 @@ pub const flag = struct {
     pub const FlagSet = flag_mod.FlagSet;
     pub const ValueType = flag_mod.ValueType;
     pub const Flag = flag_mod.Flag;
+    pub const duration = @import("core/flag/duration.zig");
+    pub const coerce = @import("core/flag/coerce.zig");
 };
 
 pub const FlagSet = flag.FlagSet;
