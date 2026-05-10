@@ -18,6 +18,7 @@ const flag_mod = @import("../flag/flag.zig");
 const parser_mod = @import("../parser/parser.zig");
 const args_mod = @import("args.zig");
 const hook_mod = @import("hook.zig");
+const help_mod = @import("../help/help.zig");
 
 pub const FlagSet = flag_mod.FlagSet;
 pub const Token = parser_mod.Token;
@@ -89,6 +90,15 @@ pub const Command = struct {
     /// whatever it points to.
     context: ?*anyopaque,
 
+    /// Storage for the auto-injected --help flag's value. Per-command;
+    /// cobra calls this lazily in execute (`InitDefaultHelpFlag`). We do
+    /// the same in `execute()`. False until the user passes --help / -h.
+    help_flag_value: bool,
+    help_flag_initialised: bool,
+    /// Owned strings the auto-help machinery had to allocate (e.g. the
+    /// `help for X` usage string). Freed on deinit.
+    help_owned_strings: std.ArrayListUnmanaged([]const u8),
+
     pub fn init(allocator: Allocator, opts: Options) !*Command {
         const cmd = try allocator.create(Command);
         errdefer allocator.destroy(cmd);
@@ -122,8 +132,37 @@ pub const Command = struct {
             .flags_set = FlagSet.init(allocator),
             .persistent_flags_set = FlagSet.init(allocator),
             .context = null,
+            .help_flag_value = false,
+            .help_flag_initialised = false,
+            .help_owned_strings = .empty,
         };
         return cmd;
+    }
+
+    /// Lazy --help / -h registration. Called at the start of execute on
+    /// the resolved command, mirroring cobra's InitDefaultHelpFlag.
+    fn initDefaultHelpFlag(self: *Command) !void {
+        if (self.help_flag_initialised) return;
+        self.help_flag_initialised = true;
+        if (self.flags_set.lookup("help") != null) return;
+
+        var help_msg_buf: [256]u8 = undefined;
+        const msg = try std.fmt.bufPrint(&help_msg_buf, "help for {s}", .{self.commandName()});
+
+        // The usage string is borrow-only on the FlagSet, but bufPrint
+        // returns a slice into the local stack buffer — we need a
+        // longer-lived copy. Allocate via the command's allocator and
+        // remember to free in deinit. Track it on the command via a
+        // lightweight optional slice.
+        const owned_msg = try self.allocator.dupe(u8, msg);
+        errdefer self.allocator.free(owned_msg);
+
+        // Bind shorthand 'h' only if not already taken.
+        const shorthand: u8 = if (self.flags_set.shorthandLookup('h') == null) 'h' else 0;
+        try self.flags_set.boolVarP(&self.help_flag_value, "help", shorthand, false, owned_msg);
+        // Stash the owned string so deinit can free it. Use the
+        // help_owned_strings list defined below.
+        try self.help_owned_strings.append(self.allocator, owned_msg);
     }
 
     /// Recursively frees this command's children, both flag sets, the
@@ -131,9 +170,28 @@ pub const Command = struct {
     pub fn deinit(self: *Command) void {
         for (self.children.items) |child| child.deinit();
         self.children.deinit(self.allocator);
+        for (self.help_owned_strings.items) |s| self.allocator.free(s);
+        self.help_owned_strings.deinit(self.allocator);
         self.flags_set.deinit();
         self.persistent_flags_set.deinit();
         self.allocator.destroy(self);
+    }
+
+    /// Render this command's help block into an owned slice. Caller frees.
+    pub fn helpString(self: *const Command, allocator: Allocator) ![]u8 {
+        return help_mod.helpString(allocator, self);
+    }
+
+    /// Render the usage block (no Long description) into an owned slice.
+    pub fn usageString(self: *const Command, allocator: Allocator) ![]u8 {
+        return help_mod.usageString(allocator, self);
+    }
+
+    /// Render help straight to the writer.
+    pub fn printHelp(self: *const Command, allocator: Allocator, writer: *std.Io.Writer) !void {
+        const text = try self.helpString(allocator);
+        defer allocator.free(text);
+        try writer.writeAll(text);
     }
 
     pub fn flags(self: *Command) *FlagSet {
@@ -308,34 +366,56 @@ pub const Command = struct {
 
     // ---- execute ------------------------------------------------------
 
+    pub const ExecuteOptions = struct {
+        diag: ?*Diagnostic = null,
+        /// Optional writer for help output. When --help is parsed (or the
+        /// command isn't runnable) execute writes the help block here and
+        /// returns successfully. When null, execute returns
+        /// `error.HelpRequested` instead, leaving rendering to the caller.
+        out_writer: ?*std.Io.Writer = null,
+    };
+
     /// Resolve subcommand, parse flags, validate args, run hook chain.
     /// `argv` should NOT include the program name (cobra's convention).
+    /// Convenience wrapper for the common "I just want to run with a
+    /// diagnostic" call.
     pub fn execute(self: *Command, argv: []const []const u8, diag: ?*Diagnostic) !void {
+        return self.executeWith(argv, .{ .diag = diag });
+    }
+
+    pub fn executeWith(self: *Command, argv: []const []const u8, opts: ExecuteOptions) !void {
         const allocator = self.allocator;
+        const diag = opts.diag;
 
         const found = try self.findCommand(allocator, argv);
         defer allocator.free(found.remaining);
         const cmd = found.cmd;
         const sub_argv = found.remaining;
 
-        // Parse with the resolved command's effective schema.
+        try cmd.initDefaultHelpFlag();
+
         const tokens = try parser_mod.parse(allocator, sub_argv, cmd.effectiveFlagSchema(), diag);
         defer allocator.free(tokens);
 
-        // Apply tokens against own + inherited persistent flag sets.
         try cmd.applyTokens(tokens, diag);
+
+        // Help dispatch: --help requested or no Run defined.
+        if (cmd.help_flag_value or (cmd.run_e == null and cmd.run == null)) {
+            if (opts.out_writer) |w| {
+                try cmd.printHelp(allocator, w);
+                return;
+            }
+            return error.HelpRequested;
+        }
 
         const positionals = cmd.flags_set.args.items;
 
-        // Validate args.
         if (cmd.args) |validator| {
             try validator.validate(cmd.valid_args, positionals, allocator, diag);
         }
 
-        // Validate required flags (own + each inherited persistent set).
         try cmd.validateRequiredFlags(diag);
 
-        // Run hook chain.
         try hook_mod.run(Command, cmd, positionals, false);
     }
 
@@ -586,6 +666,55 @@ test "Command: required flag enforcement" {
 
     try root.execute(&.{ "--name", "alice" }, null);
     try testing.expectEqualStrings("alice", name);
+}
+
+test "Command: --help prints help to provided writer" {
+    const gpa = testing.allocator;
+    const root = try Command.init(gpa, .{
+        .use = "tool",
+        .short = "a tool",
+        .run_e = noopRun,
+    });
+    defer root.deinit();
+    var name: []const u8 = "world";
+    try root.flags().stringVarP(&name, "name", 'n', "world", "who to greet");
+
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try root.executeWith(&.{"--help"}, .{ .out_writer = &aw.writer });
+
+    const out = aw.writer.buffered();
+    try testing.expect(std.mem.indexOf(u8, out, "Usage:") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "  -n, --name string") != null);
+    // run shouldn't have fired (name still default).
+    try testing.expectEqualStrings("world", name);
+}
+
+test "Command: --help with no out_writer returns HelpRequested" {
+    const gpa = testing.allocator;
+    const root = try Command.init(gpa, .{ .use = "tool", .run_e = noopRun });
+    defer root.deinit();
+    try testing.expectError(error.HelpRequested, root.execute(&.{"--help"}, null));
+}
+
+test "Command: -h shorthand triggers help" {
+    const gpa = testing.allocator;
+    const root = try Command.init(gpa, .{ .use = "tool", .run_e = noopRun });
+    defer root.deinit();
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try root.executeWith(&.{"-h"}, .{ .out_writer = &aw.writer });
+    try testing.expect(std.mem.indexOf(u8, aw.writer.buffered(), "Usage:") != null);
+}
+
+test "Command: command without run prints help even without --help" {
+    const gpa = testing.allocator;
+    const root = try Command.init(gpa, .{ .use = "tool", .short = "no run defined" });
+    defer root.deinit();
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try root.executeWith(&.{}, .{ .out_writer = &aw.writer });
+    try testing.expect(std.mem.indexOf(u8, aw.writer.buffered(), "Usage:") != null);
 }
 
 // ---- shared test fixtures -----------------------------------------------

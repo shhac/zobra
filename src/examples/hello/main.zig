@@ -44,10 +44,14 @@ pub fn main(init: std.process.Init) !void {
     const argv_full = try init.minimal.args.toSlice(arena);
     const argv = if (argv_full.len > 0) argv_full[1..] else argv_full;
 
-    root.execute(argv, null) catch |err| {
-        const stderr = std.process.exit;
-        _ = stderr;
+    const io = init.io;
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
+    const stdout = &stdout_file_writer.interface;
+
+    root.executeWith(argv, .{ .out_writer = stdout }) catch |err| {
         std.debug.print("error: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
+    try stdout.flush();
 }
