@@ -58,6 +58,7 @@ test {
     _ = @import("core/command/args.zig");
     _ = @import("core/command/command.zig");
     _ = @import("core/command/hook.zig");
+    _ = @import("core/command/suggest.zig");
     _ = @import("core/help/usage.zig");
     _ = @import("core/help/help.zig");
 }

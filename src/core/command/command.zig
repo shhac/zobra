@@ -18,6 +18,7 @@ const flag_mod = @import("../flag/flag.zig");
 const parser_mod = @import("../parser/parser.zig");
 const args_mod = @import("args.zig");
 const hook_mod = @import("hook.zig");
+const suggest_mod = @import("suggest.zig");
 const help_mod = @import("../help/help.zig");
 
 pub const FlagSet = flag_mod.FlagSet;
@@ -36,6 +37,19 @@ pub const Options = struct {
     deprecated: []const u8 = "",
     aliases: []const []const u8 = &.{},
     valid_args: []const []const u8 = &.{},
+    suggest_for: []const []const u8 = &.{},
+    disable_suggestions: bool = false,
+    suggestions_minimum_distance: usize = 2,
+    /// Auto-injects `--version` (long-only; no shorthand auto-binding).
+    /// Empty means no version flag.
+    version: []const u8 = "",
+    /// Skip flag parsing entirely; pass argv to the command verbatim.
+    /// Used for proxy commands.
+    disable_flag_parsing: bool = false,
+    /// Allow unknown flags through without raising UnknownFlag. The flag
+    /// (and its value, if value-looking) is silently dropped from
+    /// post-apply positionals.
+    allow_unknown_flags: bool = false,
     hidden: bool = false,
     silence_usage: bool = false,
     silence_errors: bool = false,
@@ -63,6 +77,12 @@ pub const Command = struct {
     deprecated: []const u8,
     aliases: []const []const u8,
     valid_args: []const []const u8,
+    suggest_for: []const []const u8,
+    disable_suggestions: bool,
+    suggestions_minimum_distance: usize,
+    version: []const u8,
+    disable_flag_parsing: bool,
+    allow_unknown_flags: bool,
     hidden: bool,
     silence_usage: bool,
     silence_errors: bool,
@@ -102,6 +122,10 @@ pub const Command = struct {
     /// the same in `execute()`. False until the user passes --help / -h.
     help_flag_value: bool,
     help_flag_initialised: bool,
+    /// Storage for the auto-injected --version flag (set when version is
+    /// non-empty). Lazily registered on first execute, like cobra.
+    version_flag_value: bool,
+    version_flag_initialised: bool,
     /// Owned strings the auto-help machinery had to allocate (e.g. the
     /// `help for X` usage string). Freed on deinit.
     help_owned_strings: std.ArrayListUnmanaged([]const u8),
@@ -118,6 +142,12 @@ pub const Command = struct {
             .deprecated = opts.deprecated,
             .aliases = opts.aliases,
             .valid_args = opts.valid_args,
+            .suggest_for = opts.suggest_for,
+            .disable_suggestions = opts.disable_suggestions,
+            .suggestions_minimum_distance = opts.suggestions_minimum_distance,
+            .version = opts.version,
+            .disable_flag_parsing = opts.disable_flag_parsing,
+            .allow_unknown_flags = opts.allow_unknown_flags,
             .hidden = opts.hidden,
             .silence_usage = opts.silence_usage,
             .silence_errors = opts.silence_errors,
@@ -144,6 +174,8 @@ pub const Command = struct {
             .context = null,
             .help_flag_value = false,
             .help_flag_initialised = false,
+            .version_flag_value = false,
+            .version_flag_initialised = false,
             .help_owned_strings = .empty,
         };
         return cmd;
@@ -173,6 +205,23 @@ pub const Command = struct {
         // Stash the owned string so deinit can free it. Use the
         // help_owned_strings list defined below.
         try self.help_owned_strings.append(self.allocator, owned_msg);
+    }
+
+    /// Lazy --version registration (only when Command.version is non-empty).
+    /// cobra binds long-only by default. zobra matches.
+    fn initDefaultVersionFlag(self: *Command) !void {
+        if (self.version_flag_initialised) return;
+        self.version_flag_initialised = true;
+        if (self.version.len == 0) return;
+        if (self.flags_set.lookup("version") != null) return;
+
+        var buf: [256]u8 = undefined;
+        const usage = try std.fmt.bufPrint(&buf, "version for {s}", .{self.commandName()});
+        const owned_usage = try self.allocator.dupe(u8, usage);
+        errdefer self.allocator.free(owned_usage);
+
+        try self.flags_set.boolVarP(&self.version_flag_value, "version", 0, false, owned_usage);
+        try self.help_owned_strings.append(self.allocator, owned_usage);
     }
 
     /// Recursively frees this command's children, both flag sets, the
@@ -440,11 +489,54 @@ pub const Command = struct {
         const sub_argv = found.remaining;
 
         try cmd.initDefaultHelpFlag();
+        try cmd.initDefaultVersionFlag();
+
+        if (cmd.disable_flag_parsing) {
+            // Pass the entire sub_argv as positionals; skip flag parsing.
+            for (sub_argv) |s| try cmd.flags_set.args.append(allocator, s);
+            const positionals = cmd.flags_set.args.items;
+            if (cmd.args) |validator| {
+                try validator.validate(cmd.valid_args, positionals, allocator, diag);
+            }
+            try hook_mod.run(Command, cmd, positionals, false);
+            return;
+        }
 
         const tokens = try parser_mod.parse(allocator, sub_argv, cmd.effectiveFlagSchema(), diag);
         defer allocator.free(tokens);
 
-        try cmd.applyTokens(tokens, diag);
+        cmd.applyTokens(tokens, diag) catch |err| switch (err) {
+            error.UnknownFlag => {
+                if (cmd.allow_unknown_flags) {
+                    // Silently swallow; reset diagnostic so later checks
+                    // don't see it.
+                    if (diag) |d| {
+                        d.category = null;
+                        d.code = null;
+                        d.flag_name = null;
+                        d.raw = null;
+                    }
+                } else {
+                    // Try to attach a "did you mean" suggestion.
+                    if (!cmd.disable_suggestions) {
+                        if (diag) |d| if (d.flag_name) |name| {
+                            try cmd.attachFlagSuggestion(d, name);
+                        };
+                    }
+                    return err;
+                }
+            },
+            else => return err,
+        };
+
+        // --version dispatch.
+        if (cmd.version_flag_value and cmd.version.len > 0) {
+            if (opts.out_writer) |w| {
+                try w.print("{s} version {s}\n", .{ cmd.commandName(), cmd.version });
+                return;
+            }
+            return error.VersionRequested;
+        }
 
         // Help dispatch: --help requested or no Run defined.
         if (cmd.help_flag_value or (cmd.run_e == null and cmd.run == null)) {
@@ -465,6 +557,46 @@ pub const Command = struct {
         try cmd.validateFlagGroups(diag);
 
         try hook_mod.run(Command, cmd, positionals, false);
+    }
+
+    /// Compute "did you mean?" suggestions for an unknown subcommand name.
+    /// Walks own children plus their `suggest_for` aliases. Returns an
+    /// owned slice of names (caller frees).
+    pub fn suggestionsForCommand(self: *const Command, allocator: Allocator, typed: []const u8) ![]const []const u8 {
+        if (self.disable_suggestions) return allocator.alloc([]const u8, 0);
+        var out: std.ArrayListUnmanaged([]const u8) = .empty;
+        errdefer out.deinit(allocator);
+
+        for (self.children.items) |c| {
+            if (c.hidden) continue;
+            const d = try suggest_mod.distance(allocator, typed, c.commandName(), true);
+            const by_lev = d <= self.suggestions_minimum_distance;
+            const by_prefix = std.ascii.startsWithIgnoreCase(c.commandName(), typed);
+            if (by_lev or by_prefix) {
+                try out.append(allocator, c.commandName());
+                continue;
+            }
+            for (c.suggest_for) |alias| {
+                if (std.ascii.eqlIgnoreCase(alias, typed)) {
+                    try out.append(allocator, c.commandName());
+                    break;
+                }
+            }
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn attachFlagSuggestion(self: *const Command, diag: *Diagnostic, typed: []const u8) !void {
+        var best: ?[]const u8 = null;
+        var best_d: usize = self.suggestions_minimum_distance + 1;
+        const allocator = self.allocator;
+        try walkFlagsForSuggestion(self, allocator, typed, &best, &best_d);
+        if (best) |b| {
+            const owned = try std.fmt.allocPrint(allocator, "did you mean --{s}?", .{b});
+            if (diag.owns_suggestion) if (diag.suggestion) |s| allocator.free(s);
+            diag.suggestion = owned;
+            diag.owns_suggestion = true;
+        }
     }
 
     fn validateFlagGroups(self: *const Command, diag: ?*Diagnostic) errors.FlagError!void {
@@ -624,6 +756,32 @@ pub const Command = struct {
         }
     }
 };
+
+fn walkFlagsForSuggestion(
+    cmd: *const Command,
+    allocator: Allocator,
+    typed: []const u8,
+    best: *?[]const u8,
+    best_d: *usize,
+) !void {
+    for (cmd.flags_set.ordered.items) |flag| {
+        const d = try suggest_mod.distance(allocator, typed, flag.name, true);
+        if (d < best_d.*) {
+            best_d.* = d;
+            best.* = flag.name;
+        }
+    }
+    var p = cmd.parent;
+    while (p) |up| : (p = up.parent) {
+        for (up.persistent_flags_set.ordered.items) |flag| {
+            const d = try suggest_mod.distance(allocator, typed, flag.name, true);
+            if (d < best_d.*) {
+                best_d.* = d;
+                best.* = flag.name;
+            }
+        }
+    }
+}
 
 // ---- private helpers ----------------------------------------------------
 
@@ -965,6 +1123,84 @@ test "Command: markFlagsOneRequired errors when none set" {
     defer diag.deinit(gpa);
     try testing.expectError(error.FlagGroupViolation, root.execute(&.{}, &diag));
     try testing.expect(std.mem.indexOf(u8, diag.message.?, "at least one of the flags in the group [json yaml] is required") != null);
+}
+
+test "Command: --version prints version banner" {
+    const gpa = testing.allocator;
+    const root = try Command.init(gpa, .{ .use = "tool", .version = "1.2.3", .run_e = noopRun });
+    defer root.deinit();
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try root.executeWith(&.{"--version"}, .{ .out_writer = &aw.writer });
+    try testing.expectEqualStrings("tool version 1.2.3\n", aw.writer.buffered());
+}
+
+test "Command: --version with no out_writer returns VersionRequested" {
+    const gpa = testing.allocator;
+    const root = try Command.init(gpa, .{ .use = "tool", .version = "9.9", .run_e = noopRun });
+    defer root.deinit();
+    try testing.expectError(error.VersionRequested, root.execute(&.{"--version"}, null));
+}
+
+test "Command: disable_flag_parsing passes argv through verbatim" {
+    const gpa = testing.allocator;
+    const RunCtx = struct {
+        var captured_args: ?[]const []const u8 = null;
+        fn run(_: *Command, args: []const []const u8) anyerror!void {
+            captured_args = args;
+        }
+    };
+
+    const root = try Command.init(gpa, .{
+        .use = "proxy",
+        .disable_flag_parsing = true,
+        .run_e = RunCtx.run,
+    });
+    defer root.deinit();
+    try root.execute(&.{ "--unknown=foo", "-x", "--bar" }, null);
+    try testing.expect(RunCtx.captured_args.?.len == 3);
+    try testing.expectEqualStrings("--unknown=foo", RunCtx.captured_args.?[0]);
+}
+
+test "Command: allow_unknown_flags swallows unknowns" {
+    const gpa = testing.allocator;
+    const root = try Command.init(gpa, .{
+        .use = "tool",
+        .allow_unknown_flags = true,
+        .run_e = noopRun,
+    });
+    defer root.deinit();
+    var n: i64 = 0;
+    try root.flags().intVarP(&n, "count", 0, 0, "");
+    try root.execute(&.{ "--count=5", "--mystery=zzz" }, null);
+    try testing.expectEqual(@as(i64, 5), n);
+}
+
+test "Command: did-you-mean suggestion on close-by flag" {
+    const gpa = testing.allocator;
+    const root = try Command.init(gpa, .{ .use = "tool", .run_e = noopRun });
+    defer root.deinit();
+    var name: []const u8 = "";
+    try root.flags().stringVarP(&name, "name", 'n', "", "");
+
+    var diag: Diagnostic = .{};
+    defer diag.deinit(gpa);
+    try testing.expectError(error.UnknownFlag, root.execute(&.{ "--nmae", "x" }, &diag));
+    try testing.expect(diag.suggestion != null);
+    try testing.expectEqualStrings("did you mean --name?", diag.suggestion.?);
+}
+
+test "Command: suggestionsForCommand returns close subcommands" {
+    const gpa = testing.allocator;
+    const root = try Command.init(gpa, .{ .use = "tool" });
+    defer root.deinit();
+    try root.addCommand(try Command.init(gpa, .{ .use = "greet", .run_e = noopRun }));
+    try root.addCommand(try Command.init(gpa, .{ .use = "list", .run_e = noopRun }));
+
+    const out = try root.suggestionsForCommand(gpa, "lst");
+    defer gpa.free(out);
+    try testing.expectEqual(@as(usize, 1), out.len);
+    try testing.expectEqualStrings("list", out[0]);
 }
 
 test "Command: command without run prints help even without --help" {
