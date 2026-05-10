@@ -215,7 +215,6 @@ pub fn typeDisplayName(t: ValueType) []const u8 {
     };
 }
 
-
 // ---- tests --------------------------------------------------------------
 
 const testing = std.testing;

@@ -82,16 +82,18 @@ pub fn completeCommand(
     }
 
     // If the partial token contains `=`, the user is typing a flag value
-    // (`--name=...`). Drop flag-name candidates entirely; we don't
-    // currently dispatch to a flag-value completer, so emitting nothing
-    // with `:NoFileComp` lets the shell fall through to file completion
-    // (a reasonable default that matches cobra when no callback is set).
+    // (`--name=...`). Drop all candidates; we don't currently dispatch to
+    // a flag-value completer, so emitting nothing with `:NoFileComp` lets
+    // the shell fall through to file completion (a reasonable default
+    // that matches cobra when no callback is set).
     const looks_like_flag_value = to_complete.len > 0 and to_complete[0] == '-' and std.mem.indexOfScalar(u8, to_complete, '=') != null;
 
-    if (to_complete.len > 0 and to_complete[0] == '-' and !after_double_dash and !looks_like_flag_value) {
-        try collectFlagCandidates(cmd, to_complete, allocator, &candidates, &owned_values);
-    } else if (!looks_like_flag_value) {
-        try collectSubcommandAndArgCandidates(cmd, to_complete, allocator, &candidates);
+    if (!looks_like_flag_value) {
+        if (to_complete.len > 0 and to_complete[0] == '-' and !after_double_dash) {
+            try collectFlagCandidates(cmd, to_complete, allocator, &candidates, &owned_values);
+        } else {
+            try collectSubcommandAndArgCandidates(cmd, to_complete, allocator, &candidates);
+        }
     }
 
     for (candidates.items) |c| {

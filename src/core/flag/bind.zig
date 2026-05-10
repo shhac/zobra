@@ -52,7 +52,7 @@ pub fn setStored(
         .duration => bindDuration(allocator, flag, value, diag),
         .string_slice => bindStringSlice(allocator, flag, value, diag),
         .string_array => bindStringArray(allocator, flag, value, diag),
-        .int_slice => bindIntSlice(allocator, flag, value, diag),
+        .int_slice => bindNumericSlice(allocator, i64, flag, value, diag, .signed, "Atoi"),
         .int32_slice => bindNumericSlice(allocator, i32, flag, value, diag, .signed, "Atoi"),
         .int64_slice => bindNumericSlice(allocator, i64, flag, value, diag, .signed, "ParseInt"),
         .float32_slice => bindNumericSlice(allocator, f32, flag, value, diag, .float, "ParseFloat"),
@@ -79,9 +79,7 @@ fn bindCustom(
 ) errors.FlagError!void {
     const cf = flag.custom orelse return error.TypeCoercionFailed;
     cf.set_fn(cf.ptr, value) catch {
-        const cause = std.fmt.allocPrint(allocator, "invalid value for {s}: {s}", .{ cf.type_name, value }) catch return error.TypeCoercionFailed;
-        defer allocator.free(cause);
-        return failCoerceWithRendered(allocator, flag, value, diag, cause);
+        return failCoerceFmt(allocator, flag, value, diag, "invalid value for {s}: {s}", .{ cf.type_name, value });
     };
 }
 
@@ -92,9 +90,7 @@ fn bindIp(
     diag: ?*Diagnostic,
 ) (errors.FlagError || std.mem.Allocator.Error)!void {
     _ = std.Io.net.IpAddress.parse(value, 0) catch {
-        const cause = std.fmt.allocPrint(allocator, "invalid IP address: {s}", .{value}) catch return error.TypeCoercionFailed;
-        defer allocator.free(cause);
-        return failCoerceWithRendered(allocator, flag, value, diag, cause);
+        return failCoerceFmt(allocator, flag, value, diag, "invalid IP address: {s}", .{value});
     };
     const p: *[]const u8 = @ptrCast(@alignCast(flag.value_ptr));
     p.* = value;
@@ -116,9 +112,7 @@ fn bindIpMask(
         }
     }
     if (!(valid_len and all_hex)) {
-        const cause = std.fmt.allocPrint(allocator, "invalid IP mask: {s}", .{value}) catch return error.TypeCoercionFailed;
-        defer allocator.free(cause);
-        return failCoerceWithRendered(allocator, flag, value, diag, cause);
+        return failCoerceFmt(allocator, flag, value, diag, "invalid IP mask: {s}", .{value});
     }
     const p: *[]const u8 = @ptrCast(@alignCast(flag.value_ptr));
     p.* = value;
@@ -131,21 +125,15 @@ fn bindIpNet(
     diag: ?*Diagnostic,
 ) (errors.FlagError || std.mem.Allocator.Error)!void {
     const slash = std.mem.indexOfScalar(u8, value, '/') orelse {
-        const cause = std.fmt.allocPrint(allocator, "invalid CIDR address: {s}", .{value}) catch return error.TypeCoercionFailed;
-        defer allocator.free(cause);
-        return failCoerceWithRendered(allocator, flag, value, diag, cause);
+        return failCoerceFmt(allocator, flag, value, diag, "invalid CIDR address: {s}", .{value});
     };
     const ip_part = value[0..slash];
     const prefix_part = value[slash + 1 ..];
     _ = std.Io.net.IpAddress.parse(ip_part, 0) catch {
-        const cause = std.fmt.allocPrint(allocator, "invalid CIDR address: {s}", .{value}) catch return error.TypeCoercionFailed;
-        defer allocator.free(cause);
-        return failCoerceWithRendered(allocator, flag, value, diag, cause);
+        return failCoerceFmt(allocator, flag, value, diag, "invalid CIDR address: {s}", .{value});
     };
     _ = std.fmt.parseInt(u8, prefix_part, 10) catch {
-        const cause = std.fmt.allocPrint(allocator, "invalid CIDR address: {s}", .{value}) catch return error.TypeCoercionFailed;
-        defer allocator.free(cause);
-        return failCoerceWithRendered(allocator, flag, value, diag, cause);
+        return failCoerceFmt(allocator, flag, value, diag, "invalid CIDR address: {s}", .{value});
     };
     const p: *[]const u8 = @ptrCast(@alignCast(flag.value_ptr));
     p.* = value;
@@ -158,16 +146,12 @@ fn bindBytesHex(
     diag: ?*Diagnostic,
 ) (errors.FlagError || std.mem.Allocator.Error)!void {
     if (value.len % 2 != 0) {
-        const cause = std.fmt.allocPrint(allocator, "encoding/hex: odd length hex string", .{}) catch return error.TypeCoercionFailed;
-        defer allocator.free(cause);
-        return failCoerceWithRendered(allocator, flag, value, diag, cause);
+        return failCoerceFmt(allocator, flag, value, diag, "encoding/hex: odd length hex string", .{});
     }
     const out = try allocator.alloc(u8, value.len / 2);
     errdefer allocator.free(out);
     _ = std.fmt.hexToBytes(out, value) catch {
-        const cause = std.fmt.allocPrint(allocator, "encoding/hex: invalid byte: {s}", .{value}) catch return error.TypeCoercionFailed;
-        defer allocator.free(cause);
-        return failCoerceWithRendered(allocator, flag, value, diag, cause);
+        return failCoerceFmt(allocator, flag, value, diag, "encoding/hex: invalid byte: {s}", .{value});
     };
     const p: *[]const u8 = @ptrCast(@alignCast(flag.value_ptr));
     if (flag.owns_value_storage) allocator.free(p.*);
@@ -182,16 +166,12 @@ fn bindBytesBase64(
 ) (errors.FlagError || std.mem.Allocator.Error)!void {
     const decoder = std.base64.standard.Decoder;
     const decoded_len = decoder.calcSizeForSlice(value) catch {
-        const cause = std.fmt.allocPrint(allocator, "illegal base64 data: {s}", .{value}) catch return error.TypeCoercionFailed;
-        defer allocator.free(cause);
-        return failCoerceWithRendered(allocator, flag, value, diag, cause);
+        return failCoerceFmt(allocator, flag, value, diag, "illegal base64 data: {s}", .{value});
     };
     const out = try allocator.alloc(u8, decoded_len);
     errdefer allocator.free(out);
     decoder.decode(out, value) catch {
-        const cause = std.fmt.allocPrint(allocator, "illegal base64 data: {s}", .{value}) catch return error.TypeCoercionFailed;
-        defer allocator.free(cause);
-        return failCoerceWithRendered(allocator, flag, value, diag, cause);
+        return failCoerceFmt(allocator, flag, value, diag, "illegal base64 data: {s}", .{value});
     };
     const p: *[]const u8 = @ptrCast(@alignCast(flag.value_ptr));
     if (flag.owns_value_storage) allocator.free(p.*);
@@ -394,34 +374,12 @@ fn bindStringArray(
     ptr.* = owned;
 }
 
-fn bindIntSlice(
-    allocator: std.mem.Allocator,
-    flag: *Flag,
-    value: []const u8,
-    diag: ?*Diagnostic,
-) (errors.FlagError || std.mem.Allocator.Error)!void {
-    // pflag's intSlice uses Atoi (decimal only). We reuse parseSignedInt
-    // with i64 — which accepts hex/octal/binary too, a documented
-    // divergence (see design-docs/09-zobra-divergences.md § 3.5).
-    var pieces: std.ArrayListUnmanaged(i64) = .empty;
-    defer pieces.deinit(allocator);
-
-    const ptr: *[]const i64 = @ptrCast(@alignCast(flag.value_ptr));
-    const old = ptr.*;
-    if (flag.changed) try pieces.appendSlice(allocator, old);
-
-    var it = std.mem.splitScalar(u8, value, ',');
-    while (it.next()) |s| {
-        const n = coerce.parseSignedInt(i64, s) catch |err| {
-            return failCoerce(allocator, flag, s, diag, "Atoi", coerce.intCause(err));
-        };
-        try pieces.append(allocator, n);
-    }
-
-    const owned = try pieces.toOwnedSlice(allocator);
-    if (flag.owns_value_storage) allocator.free(old);
-    ptr.* = owned;
-}
+// pflag's intSlice uses Atoi (decimal only). zobra dispatches the
+// `.int_slice` arm through `bindNumericSlice(i64, .signed, "Atoi")`,
+// which accepts hex/octal/binary too — a documented divergence
+// (design-docs/09-zobra-divergences.md § 3.5). The dispatch line in
+// `setStored` is the only call site; no separate `bindIntSlice`
+// function is needed.
 
 pub fn freeSliceStorage(allocator: std.mem.Allocator, flag: *Flag) void {
     switch (flag.value_type) {
@@ -571,6 +529,23 @@ fn failCoerce(
     };
     defer allocator.free(cause_msg);
     return failCoerceWithRendered(allocator, flag, value, diag, cause_msg);
+}
+
+/// Format an error cause via `fmt`/`args`, then route through
+/// `failCoerceWithRendered`. Centralises the 10-site allocPrint +
+/// free + render triple used by the non-numeric `bind*` helpers
+/// (IP, bytes, custom, anywhere the message isn't a strconv-shape).
+fn failCoerceFmt(
+    allocator: std.mem.Allocator,
+    flag: *Flag,
+    value: []const u8,
+    diag: ?*Diagnostic,
+    comptime fmt: []const u8,
+    args: anytype,
+) errors.FlagError {
+    const cause = std.fmt.allocPrint(allocator, fmt, args) catch return error.TypeCoercionFailed;
+    defer allocator.free(cause);
+    return failCoerceWithRendered(allocator, flag, value, diag, cause);
 }
 
 fn failCoerceWithRendered(
