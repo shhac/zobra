@@ -117,138 +117,29 @@ fn writeSeeAlsoLink(
 }
 
 fn writeOptionsSection(allocator: std.mem.Allocator, cmd: *const Command, w: *std.Io.Writer) !void {
-    // Local flags (own + own-persistent merged, mirroring cobra's
-    // NonInheritedFlags() shape — local to this command, including its
-    // persistent flags). Inherited persistent flags from ancestors go
-    // in a separate "Options inherited from parent commands" section.
-    const own_block = try renderLocalFlags(allocator, cmd);
-    defer allocator.free(own_block);
-    if (own_block.len > 0) {
+    // The flag-rendering machinery (column-alignment, type-display,
+    // back-quote unquoting, default/deprecated suffixes) lives in
+    // zobra.usage. We call it directly so doc output and `tool --help`
+    // can never drift.
+    const own = try zobra.usage.flagUsagesMerged(allocator, &.{ &cmd.flags_set, &cmd.persistent_flags_set });
+    defer allocator.free(own);
+    if (own.len > 0) {
         try w.writeAll("### Options\n\n```\n");
-        try w.writeAll(own_block);
+        try w.writeAll(own);
         try w.writeAll("```\n\n");
     }
 
-    const inherited = try renderInheritedFlags(allocator, cmd);
-    defer allocator.free(inherited);
-    if (inherited.len > 0) {
-        try w.writeAll("### Options inherited from parent commands\n\n```\n");
-        try w.writeAll(inherited);
-        try w.writeAll("```\n\n");
-    }
-}
-
-/// Concatenate own flags + own-persistent flags as one rendered block
-/// (cobra calls this "non-inherited" — local to this command).
-fn renderLocalFlags(allocator: std.mem.Allocator, cmd: *const Command) ![]u8 {
-    const own_count = countNonHidden(&cmd.flags_set);
-    const persistent_count = countNonHidden(&cmd.persistent_flags_set);
-    if (own_count + persistent_count == 0) return allocator.dupe(u8, "");
-
-    // We can't go through zobra's help_mod here without exposing it via
-    // zobra's public surface. The renderer in zobra/help/usage.zig is
-    // private to that subtree. Re-render here by walking the flag list
-    // ourselves with the same column-alignment trick.
-    return renderFlagsBlock(allocator, &.{ &cmd.flags_set, &cmd.persistent_flags_set });
-}
-
-fn renderInheritedFlags(allocator: std.mem.Allocator, cmd: *const Command) ![]u8 {
-    const sets = try util.collectInheritedPersistentSets(allocator, cmd);
-    defer allocator.free(sets);
-    if (sets.len == 0) return allocator.dupe(u8, "");
-    return renderFlagsBlock(allocator, sets);
-}
-
-fn countNonHidden(set: *const zobra.FlagSet) usize {
-    var n: usize = 0;
-    for (set.ordered.items) |f| if (!f.hidden) {
-        n += 1;
-    };
-    return n;
-}
-
-/// Re-render flag list across N flag-sets — same shape as zobra's
-/// help/usage.flagUsagesMerged but in this module to avoid a private
-/// import. Sort by name; pflag-byte-aligned columns.
-fn renderFlagsBlock(allocator: std.mem.Allocator, sets: []const *const zobra.FlagSet) ![]u8 {
-    const flags = try util.collectVisibleSortedFlags(allocator, sets);
-    defer allocator.free(flags);
-
-    var prefix_lines: std.ArrayListUnmanaged([]u8) = .empty;
-    defer {
-        for (prefix_lines.items) |l| allocator.free(l);
-        prefix_lines.deinit(allocator);
-    }
-    var tail_lines: std.ArrayListUnmanaged([]u8) = .empty;
-    defer {
-        for (tail_lines.items) |l| allocator.free(l);
-        tail_lines.deinit(allocator);
-    }
-
-    var maxlen: usize = 0;
-    for (flags) |flag| {
-        const prefix = try renderPrefix(allocator, flag);
-        const tail = try renderTail(allocator, flag);
-        if (prefix.len > maxlen) maxlen = prefix.len;
-        try prefix_lines.append(allocator, prefix);
-        try tail_lines.append(allocator, tail);
-    }
-
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
-    const w = &aw.writer;
-
-    for (prefix_lines.items, tail_lines.items) |prefix, tail| {
-        try w.writeAll(prefix);
-        try w.splatByteAll(' ', maxlen - prefix.len + 2);
-        try w.writeAll(tail);
-        try w.writeByte('\n');
-    }
-    return aw.toOwnedSlice();
-}
-
-fn renderPrefix(allocator: std.mem.Allocator, flag: *const zobra.flag.Flag) ![]u8 {
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
-    const w = &aw.writer;
-    if (flag.shorthand != 0 and flag.deprecated.len == 0) {
-        try w.print("  -{c}, --{s}", .{ flag.shorthand, flag.name });
-    } else {
-        try w.print("      --{s}", .{flag.name});
-    }
-    const tn = flag.typeName();
-    if (tn.len > 0) try w.print(" {s}", .{tn});
-    if (flag.no_opt_def_val.len > 0) {
-        switch (flag.value_type) {
-            .string => try w.print("[=\"{s}\"]", .{flag.no_opt_def_val}),
-            .bool => if (!std.mem.eql(u8, flag.no_opt_def_val, "true")) {
-                try w.print("[={s}]", .{flag.no_opt_def_val});
-            },
-            .count => if (!std.mem.eql(u8, flag.no_opt_def_val, "+1")) {
-                try w.print("[={s}]", .{flag.no_opt_def_val});
-            },
-            else => try w.print("[={s}]", .{flag.no_opt_def_val}),
+    const inherited_sets = try util.collectInheritedPersistentSets(allocator, cmd);
+    defer allocator.free(inherited_sets);
+    if (inherited_sets.len > 0) {
+        const inherited = try zobra.usage.flagUsagesMerged(allocator, inherited_sets);
+        defer allocator.free(inherited);
+        if (inherited.len > 0) {
+            try w.writeAll("### Options inherited from parent commands\n\n```\n");
+            try w.writeAll(inherited);
+            try w.writeAll("```\n\n");
         }
     }
-    return aw.toOwnedSlice();
-}
-
-fn renderTail(allocator: std.mem.Allocator, flag: *const zobra.flag.Flag) ![]u8 {
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
-    const w = &aw.writer;
-    try w.writeAll(flag.usage);
-    if (!flag.isZeroDefault()) {
-        if (flag.value_type == .string) {
-            try w.print(" (default \"{s}\")", .{flag.default_value_string});
-        } else {
-            try w.print(" (default {s})", .{flag.default_value_string});
-        }
-    }
-    if (flag.deprecated.len > 0) {
-        try w.print(" (DEPRECATED: {s})", .{flag.deprecated});
-    }
-    return aw.toOwnedSlice();
 }
 
 /// Walk the command tree and write one markdown file per non-hidden,

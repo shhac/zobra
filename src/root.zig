@@ -43,6 +43,13 @@ pub const HookFnE = command_mod.HookFnE;
 pub const args = @import("core/command/args.zig");
 pub const ArgsValidator = args.ArgsValidator;
 
+/// Flag-usage rendering helpers (cobra's "Flag.Usages()" surface).
+/// Exposed so doc generators (and end-users wanting custom help) can
+/// reuse the canonical column-aligned renderer rather than duplicate
+/// it. `flagUsagesMerged` accepts multiple flag-sets and merges them
+/// by name for combined "Flags + Persistent Flags" output.
+pub const usage = @import("core/help/usage.zig");
+
 /// Writes a placeholder banner to the given writer. Goes away once the
 /// example exe has something more meaningful to show (Phase 3).
 pub fn hello(writer: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -63,6 +70,7 @@ test {
     _ = @import("core/flag/bind.zig");
     _ = @import("core/command/args.zig");
     _ = @import("core/command/command.zig");
+    _ = @import("core/command/defaults.zig");
     _ = @import("core/command/groups.zig");
     _ = @import("core/command/hook.zig");
     _ = @import("core/command/suggest.zig");
