@@ -355,6 +355,152 @@ test "Flag.isZeroDefault: covers every ValueType variant" {
     try std.testing.expect(fs.lookup("z_strs").?.isZeroDefault());
 }
 
+test "Flag.isZeroDefault: exotic-type arms (slice/map/ip/bytes/custom)" {
+    const gpa = std.testing.allocator;
+    var fs = zobra.flag.FlagSet.init(gpa);
+    defer fs.deinit();
+
+    var ss: []const []const u8 = &.{};
+    try fs.stringSliceVarP(&ss, "z_strs", 0, &.{}, "");
+    var sa: []const []const u8 = &.{};
+    try fs.stringArrayVarP(&sa, "z_strarr", 0, &.{}, "");
+    var ints: []const i64 = &.{};
+    try fs.intSliceVarP(&ints, "z_ints", 0, &.{}, "");
+    var i32s: []const i32 = &.{};
+    try fs.int32SliceVarP(&i32s, "z_i32s", 0, &.{}, "");
+    var i64s: []const i64 = &.{};
+    try fs.int64SliceVarP(&i64s, "z_i64s", 0, &.{}, "");
+    var f32s: []const f32 = &.{};
+    try fs.float32SliceVarP(&f32s, "z_f32s", 0, &.{}, "");
+    var f64s: []const f64 = &.{};
+    try fs.float64SliceVarP(&f64s, "z_f64s", 0, &.{}, "");
+    var bs: []const bool = &.{};
+    try fs.boolSliceVarP(&bs, "z_bs", 0, &.{}, "");
+    var ds: []const i64 = &.{};
+    try fs.durationSliceVarP(&ds, "z_ds", 0, &.{}, "");
+
+    var ip_v: []const u8 = "";
+    try fs.ipVarP(&ip_v, "z_ip", 0, "", "");
+    var ipm: []const u8 = "";
+    try fs.ipMaskVarP(&ipm, "z_ipm", 0, "", "");
+    var ipn: []const u8 = "";
+    try fs.ipNetVarP(&ipn, "z_ipn", 0, "", "");
+
+    var bh: []const u8 = "";
+    try fs.bytesHexVarP(&bh, "z_bh", 0, "", "");
+    var bb: []const u8 = "";
+    try fs.bytesBase64VarP(&bb, "z_bb", 0, "", "");
+
+    var sts: std.StringHashMapUnmanaged([]const u8) = .empty;
+    try fs.stringToStringVarP(&sts, "z_sts", 0, "");
+    var sti: std.StringHashMapUnmanaged(i32) = .empty;
+    try fs.stringToIntVarP(&sti, "z_sti", 0, "");
+    var sti64: std.StringHashMapUnmanaged(i64) = .empty;
+    try fs.stringToInt64VarP(&sti64, "z_sti64", 0, "");
+
+    inline for (.{ "z_strs", "z_strarr", "z_ints", "z_i32s", "z_i64s", "z_f32s", "z_f64s", "z_bs", "z_ds", "z_bh", "z_bb", "z_sts", "z_sti", "z_sti64" }) |name| {
+        try std.testing.expect(fs.lookup(name).?.isZeroDefault());
+    }
+    inline for (.{ "z_ip", "z_ipm", "z_ipn" }) |name| {
+        try std.testing.expect(fs.lookup(name).?.isZeroDefault());
+    }
+}
+
+test "Flag.typeName: exotic-type arms + int64/uint64 aliasing" {
+    const gpa = std.testing.allocator;
+    var fs = zobra.flag.FlagSet.init(gpa);
+    defer fs.deinit();
+
+    // int64/uint64 alias to "int"/"uint" — pflag's display convention.
+    var i64v: i64 = 0;
+    var u64v: u64 = 0;
+    try fs.int64VarP(&i64v, "v_int64", 0, 0, "");
+    try fs.uint64VarP(&u64v, "v_uint64", 0, 0, "");
+    try std.testing.expectEqualStrings("int", fs.lookup("v_int64").?.typeName());
+    try std.testing.expectEqualStrings("uint", fs.lookup("v_uint64").?.typeName());
+
+    var ss: []const []const u8 = &.{};
+    try fs.stringSliceVarP(&ss, "v_strs", 0, &.{}, "");
+    var sa: []const []const u8 = &.{};
+    try fs.stringArrayVarP(&sa, "v_strarr", 0, &.{}, "");
+    var ints: []const i64 = &.{};
+    try fs.intSliceVarP(&ints, "v_ints", 0, &.{}, "");
+    var i32s: []const i32 = &.{};
+    try fs.int32SliceVarP(&i32s, "v_i32s", 0, &.{}, "");
+    var f32s: []const f32 = &.{};
+    try fs.float32SliceVarP(&f32s, "v_f32s", 0, &.{}, "");
+    var f64s: []const f64 = &.{};
+    try fs.float64SliceVarP(&f64s, "v_f64s", 0, &.{}, "");
+    var bs: []const bool = &.{};
+    try fs.boolSliceVarP(&bs, "v_bs", 0, &.{}, "");
+    var ds: []const i64 = &.{};
+    try fs.durationSliceVarP(&ds, "v_ds", 0, &.{}, "");
+
+    var ip_v: []const u8 = "";
+    try fs.ipVarP(&ip_v, "v_ip", 0, "", "");
+    var ipm: []const u8 = "";
+    try fs.ipMaskVarP(&ipm, "v_ipm", 0, "", "");
+    var ipn: []const u8 = "";
+    try fs.ipNetVarP(&ipn, "v_ipn", 0, "", "");
+
+    var bh: []const u8 = "";
+    try fs.bytesHexVarP(&bh, "v_bh", 0, "", "");
+    var bb: []const u8 = "";
+    try fs.bytesBase64VarP(&bb, "v_bb", 0, "", "");
+
+    var sts: std.StringHashMapUnmanaged([]const u8) = .empty;
+    try fs.stringToStringVarP(&sts, "v_sts", 0, "");
+    var sti: std.StringHashMapUnmanaged(i32) = .empty;
+    try fs.stringToIntVarP(&sti, "v_sti", 0, "");
+    var sti64: std.StringHashMapUnmanaged(i64) = .empty;
+    try fs.stringToInt64VarP(&sti64, "v_sti64", 0, "");
+
+    try std.testing.expectEqualStrings("strings", fs.lookup("v_strs").?.typeName());
+    try std.testing.expectEqualStrings("stringArray", fs.lookup("v_strarr").?.typeName());
+    try std.testing.expectEqualStrings("ints", fs.lookup("v_ints").?.typeName());
+    try std.testing.expectEqualStrings("int32Slice", fs.lookup("v_i32s").?.typeName());
+    try std.testing.expectEqualStrings("float32Slice", fs.lookup("v_f32s").?.typeName());
+    try std.testing.expectEqualStrings("float64Slice", fs.lookup("v_f64s").?.typeName());
+    try std.testing.expectEqualStrings("bools", fs.lookup("v_bs").?.typeName());
+    try std.testing.expectEqualStrings("durationSlice", fs.lookup("v_ds").?.typeName());
+    try std.testing.expectEqualStrings("ip", fs.lookup("v_ip").?.typeName());
+    try std.testing.expectEqualStrings("ipMask", fs.lookup("v_ipm").?.typeName());
+    try std.testing.expectEqualStrings("ipNet", fs.lookup("v_ipn").?.typeName());
+    try std.testing.expectEqualStrings("bytesHex", fs.lookup("v_bh").?.typeName());
+    try std.testing.expectEqualStrings("bytesBase64", fs.lookup("v_bb").?.typeName());
+    try std.testing.expectEqualStrings("stringToString", fs.lookup("v_sts").?.typeName());
+    try std.testing.expectEqualStrings("stringToInt", fs.lookup("v_sti").?.typeName());
+    try std.testing.expectEqualStrings("stringToInt64", fs.lookup("v_sti64").?.typeName());
+}
+
+test "Flag.typeName: custom flag uses vtable type_name" {
+    const gpa = std.testing.allocator;
+    var fs = zobra.flag.FlagSet.init(gpa);
+    defer fs.deinit();
+
+    const CustomCtx = struct {
+        value: []const u8 = "",
+        fn set(ptr: *anyopaque, v: []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.value = v;
+        }
+        fn str(ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return alloc.dupe(u8, self.value);
+        }
+    };
+    var ctx: CustomCtx = .{};
+    const cf: zobra.flag.CustomFlag = .{
+        .ptr = &ctx,
+        .type_name = "json",
+        .set_fn = CustomCtx.set,
+        .string_fn = CustomCtx.str,
+    };
+    try fs.varP(cf, "config", 0, "JSON blob");
+
+    try std.testing.expectEqualStrings("json", fs.lookup("config").?.typeName());
+}
+
 test "Flag.typeName: cobra-style display names" {
     const gpa = std.testing.allocator;
     var fs = zobra.flag.FlagSet.init(gpa);
