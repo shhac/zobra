@@ -512,18 +512,6 @@ fn findCharSlice(raw: []const u8, c: u8) []const u8 {
     return raw[idx .. idx + 1];
 }
 
-/// Public re-export so other modules (specifically command.zig, which has
-/// its own apply loop with the Command-tree effective lookup) can store
-/// values without duplicating the dispatch table.
-pub fn setStoredExternal(
-    allocator: std.mem.Allocator,
-    flag: *Flag,
-    value: []const u8,
-    diag: ?*Diagnostic,
-) (errors.FlagError || std.mem.Allocator.Error)!void {
-    return setStored(allocator, flag, value, diag);
-}
-
 /// Type of a flag-lookup callback. Used by `applyTokensWith` so the same
 /// dispatch loop can drive both `FlagSet.apply` (own-flags lookup) and
 /// `Command.applyTokens` (own + inherited persistent lookup).
