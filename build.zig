@@ -31,10 +31,14 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // The demo binary lives under `examples/` (outside `src/`) so it
+    // never ships to consumers — build.zig.zon's `paths` only includes
+    // `src/` plus build/license/readme. The example exists for `zig build run`
+    // dogfooding and as the target of the E2E smoke tests.
     const example_exe = b.addExecutable(.{
         .name = "zobra-example",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/examples/hello/main.zig"),
+            .root_source_file = b.path("examples/hello/main.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -77,4 +81,33 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_doc_tests.step);
     test_step.dependOn(&run_completion_tests.step);
     test_step.dependOn(&run_integration_tests.step);
+
+    // E2E smoke tests — spawn the built `zobra-example` binary as a
+    // subprocess and assert on stdout/stderr/exit. Wired as a separate
+    // `zig build test-e2e` step so it can be skipped in environments
+    // where the binary can't be exec'd (some CI sandboxes). The test
+    // module is given the absolute install-prefix path to the binary
+    // via the `build_options` import.
+    const e2e_opts = b.addOptions();
+    const bin_install_path = b.fmt("{s}/bin/zobra-example", .{b.install_prefix});
+    e2e_opts.addOption([]const u8, "bin_path", bin_install_path);
+
+    const e2e_mod = b.createModule(.{
+        .root_source_file = b.path("examples/hello/test_e2e.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "build_options", .module = e2e_opts.createModule() },
+        },
+    });
+    const e2e_tests = b.addTest(.{ .root_module = e2e_mod });
+    const run_e2e_tests = b.addRunArtifact(e2e_tests);
+    run_e2e_tests.step.dependOn(b.getInstallStep()); // ensure binary exists
+
+    const e2e_step = b.step("test-e2e", "Run end-to-end smoke tests against the demo binary");
+    e2e_step.dependOn(&run_e2e_tests.step);
+
+    // The default `test` step doesn't include E2E (subprocess spawning
+    // is heavier and depends on the install step). Run both with
+    // `zig build test test-e2e`.
 }

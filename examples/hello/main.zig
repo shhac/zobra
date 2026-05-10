@@ -15,10 +15,13 @@ var greet_name: []const u8 = "world";
 var verbose: i32 = 0;
 
 fn greet(cmd: *zobra.Command, args: []const []const u8) anyerror!void {
-    _ = cmd;
+    // Use the writer plugged in via root.setOut at main() time. Walking
+    // `cmd.outWriter()` follows the parent chain so children inherit
+    // the same stdout. This is the cobra-equivalent of `cmd.OutOrStdout()`.
+    const w = cmd.outWriter() orelse return;
     const target = if (args.len > 0) args[0] else greet_name;
-    std.debug.print("hello, {s}\n", .{target});
-    if (verbose > 0) std.debug.print("verbose={d}\n", .{verbose});
+    try w.print("hello, {s}\n", .{target});
+    if (verbose > 0) try w.print("verbose={d}\n", .{verbose});
 }
 
 pub fn main(init: std.process.Init) !void {

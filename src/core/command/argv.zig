@@ -17,17 +17,35 @@ pub const Token = parser_mod.Token;
 ///
 /// Note: this is *not* the same as the position of the first positional
 /// token in the token slice. Long/short tokens with a separate-argv
-/// value consume two argv slots, so the mapping from token-index to
-/// argv-index isn't 1:1. The byte-pointer aliasing in `argvUsedByToken`
-/// reconstructs it.
+/// value consume two argv slots; short-flag clusters (`-vab`) emit
+/// multiple short tokens that share ONE argv slot. The byte-pointer
+/// aliasing in `argvUsedByToken` plus `last_raw` tracking reconstructs
+/// the slot count.
 pub fn firstPositionalArgvIndex(tokens: []const Token, argv: []const []const u8) ?usize {
     var pi: usize = 0;
+    var last_raw: []const u8 = "";
     for (tokens) |t| switch (t) {
         .positional => return pi,
         .terminator, .passthrough => return null,
-        .long, .short, .negated => {
+        .long => |l| {
             pi += argvUsedByToken(t, argv, pi);
             if (pi > argv.len) return null;
+            last_raw = l.raw;
+        },
+        .short => |s| {
+            // Short tokens from a cluster (-vab) all share the same
+            // `raw` argv-element slice. Only the first one consumes
+            // an argv slot.
+            if (!slicesAlias(s.raw, last_raw)) {
+                pi += argvUsedByToken(t, argv, pi);
+                if (pi > argv.len) return null;
+            }
+            last_raw = s.raw;
+        },
+        .negated => |n| {
+            pi += argvUsedByToken(t, argv, pi);
+            if (pi > argv.len) return null;
+            last_raw = n.raw;
         },
     };
     return null;
@@ -117,6 +135,19 @@ test "firstPositionalArgvIndex: terminator stops the search" {
         .{ .passthrough = "x" },
     };
     try testing.expect(firstPositionalArgvIndex(tokens, argv) == null);
+}
+
+test "firstPositionalArgvIndex: short-flag cluster shares ONE argv slot, then positional" {
+    // Regression for `-vv greet` panicking at findRec. The parser emits
+    // two `.short` tokens from `-vv` (both with raw=argv[0]); only the
+    // first consumes an argv slot. The positional `greet` is at index 1.
+    const argv: []const []const u8 = &.{ "-vv", "greet" };
+    const tokens: []const Token = &.{
+        .{ .short = .{ .name = 'v', .value = null, .raw = argv[0] } },
+        .{ .short = .{ .name = 'v', .value = null, .raw = argv[0] } },
+        .{ .positional = .{ .value = argv[1] } },
+    };
+    try testing.expectEqual(@as(?usize, 1), firstPositionalArgvIndex(tokens, argv));
 }
 
 test "argvWithout: drops the indexed element" {

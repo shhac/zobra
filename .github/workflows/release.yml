@@ -1,0 +1,107 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# zobra is a Zig source library. The release workflow does NOT build
+# or upload binaries — consumers fetch the source tarball via
+# `zig fetch --save https://github.com/.../archive/refs/tags/vX.Y.Z.tar.gz`.
+# What this workflow does:
+#   1. Verify the tag is valid semver.
+#   2. Run the full test suite + format check against the tagged commit
+#      so we never publish a release with broken tests.
+#   3. Run the E2E smoke tests against the built demo binary.
+#   4. Create a GitHub Release with notes extracted from CHANGELOG.md.
+#   5. GitHub auto-generates the source tarball — no upload step.
+#
+# Files outside `build.zig.zon`'s `paths` field (oracle/, test/,
+# design-docs/, scripts/, examples/) are still in the auto-tarball
+# but invisible to Zig's package manager (excluded from the hash).
+# Consumers only see what `paths` exposes: src/, build.zig,
+# build.zig.zon, LICENSE, README.md.
+
+jobs:
+  verify-and-release:
+    name: Verify + publish release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Zig 0.16.0
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: '0.16.0'
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          SEMVER="${TAG#v}"
+          if ! printf '%s' "$SEMVER" | grep -qxE '[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "Error: tag '$TAG' is not valid semver (expected vX.Y.Z)" >&2
+            exit 1
+          fi
+          echo "TAG=$TAG" >> $GITHUB_OUTPUT
+          echo "SEMVER=$SEMVER" >> $GITHUB_OUTPUT
+
+      - name: Verify build.zig.zon version matches tag
+        run: |
+          ZON_VERSION=$(grep -E '\.version = "' build.zig.zon | sed -E 's/.*"([^"]+)".*/\1/')
+          EXPECTED="${{ steps.version.outputs.SEMVER }}"
+          if [ "$ZON_VERSION" != "$EXPECTED" ]; then
+            echo "Error: build.zig.zon version is '$ZON_VERSION' but tag is 'v$EXPECTED'" >&2
+            echo "Bump .version in build.zig.zon to match the tag before pushing." >&2
+            exit 1
+          fi
+
+      - name: Format check
+        run: zig fmt --check src test build.zig examples
+
+      - name: Run unit + integration tests
+        run: zig build test --summary all
+
+      - name: Run E2E smoke tests
+        run: zig build test-e2e --summary all
+
+      - name: Extract release notes from CHANGELOG.md
+        id: notes
+        run: |
+          SEMVER="${{ steps.version.outputs.SEMVER }}"
+          awk "/^## \[${SEMVER}\]/{flag=1; next} /^## \[/{flag=0} flag" CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "Release v${SEMVER}" > release-notes.md
+            echo "" >> release-notes.md
+            echo "See [CHANGELOG.md](CHANGELOG.md) for details." >> release-notes.md
+          fi
+          {
+            echo ""
+            echo "## Install"
+            echo ""
+            echo '```zig'
+            echo "// build.zig.zon"
+            echo ".dependencies = .{"
+            echo "    .zobra = .{"
+            echo "        .url = \"https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/v${SEMVER}.tar.gz\","
+            echo "        // .hash filled in by \`zig fetch --save\`"
+            echo "    },"
+            echo "},"
+            echo '```'
+          } >> release-notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2
+        with:
+          tag_name: ${{ steps.version.outputs.TAG }}
+          name: ${{ steps.version.outputs.TAG }}
+          body_path: release-notes.md
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

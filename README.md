@@ -4,11 +4,11 @@ A zero-dependency Zig port of [spf13/cobra](https://github.com/spf13/cobra) — 
 
 > _zobra_ — `z` (Zig) + `(c)obra`. A different snake. Same library, ported.
 
-## Status: feature-parity-with-cobra-core (Phase 0–6 + vipvot-parity push complete)
+## Status: v0.1.0 — cobra-feature-complete
 
-215 tests, format clean. The library now ships **34 flag types** (full pflag parity), persistent flags + the five-stage hook chain, flag groups, args validators, byte-aligned help / usage rendering, `--help` / `-h` / `--version` auto-injection, the `help [path]` subcommand, suggestions on unknown flags / commands, `setOut` / `setErr` / `setHelpFunc` / `setUsageFunc`, the auto-print `Error: …` + usage path on parse errors (`executeAndPrint`), and the `CustomFlag` vtable for user-defined flag types.
+286 tests (277 unit/integration + 9 E2E smoke), format clean. See [`CHANGELOG.md`](CHANGELOG.md) for v0.1.0 release notes. The library ships **34 flag types** (full pflag parity), persistent flags + the five-stage hook chain, flag groups, args validators, byte-aligned help / usage rendering, `--help` / `-h` / `--version` auto-injection, the `help [path]` subcommand, suggestions on unknown flags / commands, `setOut` / `setErr` / `setHelpFunc` / `setUsageFunc`, the auto-print `Error: …` + usage path on parse errors (`executeAndPrint`), and the `CustomFlag` vtable for user-defined flag types.
 
-Doc generators (`zobra-doc`) and shell completion (`zobra-completion`) are explicit Phase 8/9 deferrals — substantial satellite modules each, scheduled for follow-up.
+**Doc generators** (`zobra-doc`) ship markdown / yaml / rest / man (+tree-walkers). **Shell completion** (`zobra-completion`) ships bash V2 / zsh / fish / powershell + the `__complete` runtime + the auto-installed `completion [shell]` subcommand.
 
 See [`COMPARISON.md`](COMPARISON.md) for the full cobra-vs-zobra feature matrix and [`design-docs/06-roadmap.md`](design-docs/06-roadmap.md) for the phased status of record.
 
@@ -21,13 +21,13 @@ The deliverable is a Zig module. Other projects pull it in via `build.zig.zon`:
 ```zig
 .dependencies = .{
     .zobra = .{
-        .url = "git+https://github.com/shhac/zobra#<rev>",
-        .hash = "...",
+        .url = "https://github.com/shhac/zobra/archive/refs/tags/v0.1.0.tar.gz",
+        // .hash filled in by `zig fetch --save`
     },
 },
 ```
 
-…and import it with `@import("zobra")`.
+…and import it with `@import("zobra")`. For a runnable demo + porting recipes, see [`examples/`](examples/README.md). For the full release history, see [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Differential testing against real cobra
 
