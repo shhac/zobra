@@ -38,6 +38,8 @@ pub const FlagSet = flag.FlagSet;
 
 const command_mod = @import("core/command/command.zig");
 pub const Command = command_mod.Command;
+pub const HookFn = command_mod.HookFn;
+pub const HookFnE = command_mod.HookFnE;
 pub const args = @import("core/command/args.zig");
 pub const ArgsValidator = args.ArgsValidator;
 

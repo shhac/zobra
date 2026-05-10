@@ -42,7 +42,9 @@ These cobra features won't ship in zobra. Each has a workaround.
 | `SetUsageTemplate` / `SetHelpTemplate` (`text/template`) | Go's `text/template` is ~hundreds of lines to port; no Zig equivalent in stdlib. The function variants (`setHelpFunc`, `setUsageFunc`) cover most use cases. | Pass a custom `*const fn (cmd: *Command, w: *Io.Writer) !void` via `setHelpFunc`. |
 | `pflag.Value` interface as nominal interface | Zig has no nominal interfaces. | `FlagValue.custom` tagged-union variant carries a vtable (`set_fn`, `string_fn`, `type_name`). Same expressive power, different shape. |
 | `BashCompletionFunction` | Legacy bash custom-completion blocks; superseded by `valid_args_function`. | Use `valid_args_function`. |
-| `completionV1` (legacy bash V1 protocol) | New tools should use V2; not ported. | Use `zobra-completion` Phase-9 generators. |
+| `completionV1` (legacy bash V1 protocol) | New tools should use V2; not ported. | Use `zobra-completion` V2 generators. |
+| `validArgsFunction` (dynamic per-command callback) | Adds a Command field; static `valid_args` covers most use cases. | Use `valid_args` for static lists; for dynamic computation, run the runtime side directly via `zobra.completion.completeCommand`. Wiring a callback field on Command is a 1-day follow-up if needed. |
+| `registerFlagCompletionFunc` (dynamic per-flag) | Adds a FlagSet-side map keyed by flag name. | Same workaround; deferred. |
 | Plugin discovery | No cobra equivalent in core; would be a zobra extension. | Out of scope. |
 | `Command.SetContext` / `Command.Context` | Go's `context.Context` doesn't have a Zig analogue. | `cmd.bindContext(*anyopaque)` + retrieve from hooks (Phase ≥3). |
 | `Command.TraverseChildren` | Already covered by persistent-flag inheritance in zobra. | No-op; the behaviour comes for free. |

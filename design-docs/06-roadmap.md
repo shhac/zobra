@@ -25,8 +25,8 @@ matrix.
 | 5c — Flag groups | done | mutex / required-together / one-required, cobra wording |
 | 6 — UX surface | done | Levenshtein suggestions, --version, disable_flag_parsing, allow_unknown_flags |
 | 7 — Comptime path | deferred | Stretch goal; runtime path is the spec |
-| 8 — `zobra-doc` | deferred | Markdown/yaml/man generators |
-| 9 — `zobra-completion` | deferred | bash/zsh/fish/pwsh shell completion |
+| 8 — `zobra-doc` | done | Markdown/yaml/rest/man generators (satellite module) |
+| 9 — `zobra-completion` | done (MVP) | bash/zsh/fish/pwsh scripts + `__complete` runtime + auto-installed `completion` subcommand |
 
 Pending follow-ups (small, mechanical):
 - The remaining slice/map/network/bytes flag types (most of pflag's

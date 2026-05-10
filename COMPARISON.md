@@ -10,8 +10,8 @@ zobra mirrors cobra's surface so a port reads as a mechanical rewrite. The trans
 | Field/method casing | PascalCase (`Run`, `RunE`, `PreRun`) | snake_case (`run`, `run_e`, `pre_run`) |
 | Pointer-to-variable | `var v string; cmd.Flags().StringVar(&v, …)` | `var v: []const u8 = ""; cmd.flags().stringVarP(&v, …)` (native `*T`) |
 | Import root | `import "github.com/spf13/cobra"` | `@import("zobra")` |
-| Doc generators | `import "github.com/spf13/cobra/doc"` | `@import("zobra-doc")` (Phase 8 — deferred) |
-| Completion generators | bundled in cobra core | `@import("zobra-completion")` (Phase 9 — deferred) |
+| Doc generators | `import "github.com/spf13/cobra/doc"` | `@import("zobra-doc")` (✓) |
+| Completion generators | bundled in cobra core | `@import("zobra-completion")` (✓) |
 
 ## Side-by-side: a small command
 
@@ -182,18 +182,21 @@ cmd.args = zobra.args.matchAll(&.{ zobra.args.minimumN(1), zobra.args.onlyValid 
 
 ## Shell completion (`zobra-completion` subpath)
 
-**Status: Phase 9 — deferred.** Same shape as doc generators — a satellite module with byte-identical scripts vendored from cobra.
+**Status: ✓ shipped (MVP).** Satellite module wired through `b.addModule("zobra-completion", ...)`. Wire protocol (`value\tdesc\n...:directive\n`) matches cobra's exactly so the existing shell completion ecosystem composes cleanly. Scripts are functional but simplified vs cobra's vendored byte-identical copy — if a fixture forces byte-for-byte parity, the templates can be replaced without touching the runtime.
 
 | Capability | Cobra | zobra |
 |---|:---:|:---:|
-| `genBashCompletion` (V2) | ✓ | deferred |
-| `genZshCompletion`, `genFishCompletion`, `genPowerShellCompletion` | ✓ | deferred |
-| `__complete` runtime callback | ✓ | deferred |
-| `validArgsFunction` | ✓ | deferred |
-| `registerFlagCompletionFunc` | ✓ | deferred |
-| `ShellCompDirective*` constants | ✓ | deferred |
-| `CompletionOptions` | ✓ | deferred |
-| Auto-registered `completion` subcommand | ✓ | deferred |
+| `genBashCompletion` (V2) | ✓ | ✓ |
+| `genZshCompletion`, `genFishCompletion`, `genPowerShellCompletion` | ✓ | ✓ |
+| `__complete` runtime callback | ✓ | ✓ (auto-registered hidden subcommand) |
+| `ShellCompDirective*` constants | ✓ | ✓ (`Default`, `Error`, `NoSpace`, `NoFileComp`, `FilterFileExt`, `FilterDirs`, `KeepOrder`) |
+| `CompletionOptions` (toggles) | ✓ | ✓ (struct shape; `disable_default_cmd` toggle wiring is a follow-up) |
+| Auto-registered `completion` subcommand | ✓ | ✓ (`installCompletionCommand`) |
+| Static `valid_args` candidate filtering | ✓ | ✓ |
+| Long-flag candidate completion (`--…`) | ✓ | ✓ |
+| `validArgsFunction` (dynamic per-command callback) | ✓ | deferred (Cobra's static `validArgs` covers most use cases; dynamic callback adds a Command field — see § Divergences) |
+| `registerFlagCompletionFunc` (per-flag dynamic) | ✓ | deferred (FlagSet field — see § Divergences) |
+| Shorthand-flag candidates (`-x`) | ✓ | deferred (single-char candidates rarely render usefully) |
 
 ## Packaging
 

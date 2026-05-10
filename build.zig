@@ -20,6 +20,17 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Satellite module: shell completion (bash/zsh/fish/pwsh) plus the
+    // __complete runtime callback. Same shape as zobra-doc — separate
+    // import keeps unused-on-most-CLIs payload out of the core module.
+    const zobra_completion_mod = b.addModule("zobra-completion", .{
+        .root_source_file = b.path("src/completion/root.zig"),
+        .target = target,
+        .imports = &.{
+            .{ .name = "zobra", .module = zobra_mod },
+        },
+    });
+
     const example_exe = b.addExecutable(.{
         .name = "zobra-example",
         .root_module = b.createModule(.{
@@ -45,6 +56,9 @@ pub fn build(b: *std.Build) void {
     const doc_tests = b.addTest(.{ .root_module = zobra_doc_mod });
     const run_doc_tests = b.addRunArtifact(doc_tests);
 
+    const completion_tests = b.addTest(.{ .root_module = zobra_completion_mod });
+    const run_completion_tests = b.addRunArtifact(completion_tests);
+
     const integration_mod = b.createModule(.{
         .root_source_file = b.path("test/all.zig"),
         .target = target,
@@ -52,6 +66,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "zobra", .module = zobra_mod },
             .{ .name = "zobra-doc", .module = zobra_doc_mod },
+            .{ .name = "zobra-completion", .module = zobra_completion_mod },
         },
     });
     const integration_tests = b.addTest(.{ .root_module = integration_mod });
@@ -60,5 +75,6 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_doc_tests.step);
+    test_step.dependOn(&run_completion_tests.step);
     test_step.dependOn(&run_integration_tests.step);
 }
