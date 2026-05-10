@@ -24,12 +24,12 @@ const apply = @import("apply.zig");
 const parser_mod = @import("../parser/parser.zig");
 const Token = @import("../parser/token.zig").Token;
 
-// Re-export the apply-loop entry + lookup typedefs through flag_mod so
-// existing callers (`flag_mod.applyTokensWith`, `flag_mod.LookupLongFn`)
-// keep working after the split into apply.zig.
+// Re-export the apply-loop entry through flag_mod so the existing
+// caller (`flag_mod.applyTokensWith` at command.zig::applyTokens) keeps
+// working after the split into apply.zig. The LookupLongFn /
+// LookupShortFn typedefs are reached via `apply.LookupLongFn` directly
+// — no external caller binds them through flag_mod.
 pub const applyTokensWith = apply.applyTokensWith;
-pub const LookupLongFn = apply.LookupLongFn;
-pub const LookupShortFn = apply.LookupShortFn;
 
 pub const FlagSchema = parser_mod.FlagSchema;
 
