@@ -40,9 +40,9 @@ pub fn run(
         var depth: usize = 0;
         var p: ?*CommandT = cmd;
         while (p) |c| : (p = c.parent) {
+            std.debug.assert(depth < stack.len);
             stack[depth] = c;
             depth += 1;
-            if (depth == stack.len) break;
         }
         var i = depth;
         while (i > 0) {

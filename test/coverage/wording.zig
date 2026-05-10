@@ -167,6 +167,32 @@ test "help: parent with subcommands prints in cobra-byte-identical column shape"
     try testing.expect(std.mem.indexOf(u8, out, "Use \"tool [command] --help\" for more information about a command.") != null);
 }
 
+// ---- onlyValid validator with command-path wording --------------------
+
+test "wording: onlyValid rejects gamma at depth and includes command path + valid_values" {
+    const gpa = testing.allocator;
+    const root = try Command.init(gpa, .{ .use = "tool" });
+    defer root.deinit();
+    const child = try Command.init(gpa, .{
+        .use = "greet",
+        .args = args_mod.onlyValid,
+        .valid_args = &.{ "alpha", "beta" },
+        .run_e = noopRun,
+    });
+    try root.addCommand(child);
+
+    var diag: Diagnostic = .{};
+    defer diag.deinit(gpa);
+    try testing.expectError(error.ArgsValidationFailed, root.execute(&.{ "greet", "gamma" }, &diag));
+    try testing.expectEqualStrings("invalid argument \"gamma\" for \"tool greet\"", diag.message.?);
+    // valid_values should be wired so a CLI can render "valid: alpha, beta"
+    // without separately threading the cmd.valid_args list.
+    try testing.expect(diag.valid_values != null);
+    try testing.expectEqual(@as(usize, 2), diag.valid_values.?.len);
+    try testing.expectEqualStrings("alpha", diag.valid_values.?[0]);
+    try testing.expectEqualStrings("beta", diag.valid_values.?[1]);
+}
+
 // ---- repeated-char shorthand suffix ------------------------------------
 
 test "wording: -aab where a is unknown — group suffix uses first match" {

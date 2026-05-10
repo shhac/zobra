@@ -13,8 +13,8 @@ pub const Diagnostic = struct {
     code: ?Code = null,
 
     /// Long-flag name (without leading "--") or single-char shorthand
-    /// rendered as a length-1 slice. Borrowed from argv where possible;
-    /// owned only when the flag layer constructed it (then owns_flag_name).
+    /// rendered as a length-1 slice. Always borrowed (from argv or the
+    /// registered flag's name field); the Diagnostic does not own it.
     flag_name: ?[]const u8 = null,
 
     /// Raw argv element that produced the error. Always borrowed from argv.

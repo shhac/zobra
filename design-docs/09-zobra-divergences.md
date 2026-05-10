@@ -67,7 +67,9 @@ These are places zobra is *more strict* than cobra, with the cobra behaviour con
 
 ## 5. The "less strict than cobra" set
 
-Currently empty. If we ever loosen a cobra constraint, document it here.
+Currently:
+
+- **Deprecated-flag warnings are silent.** cobra's pflag prints `Flag --foo has been deprecated, <message>` to stderr when a deprecated flag is passed; cobra's command also prints `Command "foo" is deprecated, <message>` for deprecated commands. zobra accepts deprecated flags / commands without printing anything. The wire shape (`Diagnostic.Code.deprecated_flag_used`, `Command.deprecated`, `Flag.deprecated`) is in place; emission needs the `setOut` / `setErr` infrastructure, which is itself deferred. Tracked as a follow-up; will land alongside the writer-routing pass.
 
 ## When to add a row
 

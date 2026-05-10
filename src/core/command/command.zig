@@ -285,10 +285,22 @@ pub const Command = struct {
         self.context = ctx;
     }
 
+    pub const AddCommandError = error{
+        AlreadyParented,
+        SelfParent,
+    } || std.mem.Allocator.Error;
+
     /// Add a child. **Ownership of `child` transfers to `self`** —
     /// `self.deinit()` will free it; callers must not also call
-    /// `child.deinit()`.
-    pub fn addCommand(self: *Command, child: *Command) !void {
+    /// `child.deinit()`. Rejects two memory-safety hazards cobra-Go
+    /// happens to absorb via GC:
+    ///   - `child.parent != null` (already in another tree) — would
+    ///     cause double-free on deinit.
+    ///   - `child == self` — would create a cycle and infinite-loop the
+    ///     deinit walk.
+    pub fn addCommand(self: *Command, child: *Command) AddCommandError!void {
+        if (child == self) return error.SelfParent;
+        if (child.parent != null) return error.AlreadyParented;
         try self.children.append(self.allocator, child);
         child.parent = self;
     }
@@ -441,17 +453,27 @@ pub const Command = struct {
         return self.use[0..idx];
     }
 
+    /// Public accessor for `flags_set.args_len_at_dash` — cobra's
+    /// `Command.ArgsLenAtDash`. Returns the number of positional args
+    /// before the `--` terminator, or null if no `--` was seen. Used by
+    /// hooks that want to distinguish positionals-before-`--` from
+    /// passthrough-after for forwarding patterns like `tool args -- subcmd-args`.
+    pub fn argsLenAtDash(self: *const Command) ?usize {
+        return self.flags_set.args_len_at_dash;
+    }
+
     /// Render the command's full path (root → ... → self) as a
     /// space-separated string — cobra's Command.CommandPath(). Caller
-    /// frees with the same allocator.
+    /// frees with the same allocator. Asserts depth < 32; pathological
+    /// trees are rejected loudly rather than silently truncated.
     pub fn commandPathString(self: *const Command, allocator: Allocator) ![]u8 {
         var stack: [32]*const Command = undefined;
         var depth: usize = 0;
         var p: ?*const Command = self;
         while (p) |c| : (p = c.parent) {
+            std.debug.assert(depth < stack.len);
             stack[depth] = c;
             depth += 1;
-            if (depth == stack.len) break;
         }
         var aw: std.Io.Writer.Allocating = .init(allocator);
         defer aw.deinit();
@@ -910,8 +932,7 @@ fn renderParseDiag(allocator: Allocator, diag: *Diagnostic) !void {
         },
         else => return,
     };
-    diag.message = rendered;
-    diag.owns_message = true;
+    diag.setOwnedMessage(allocator, rendered);
 }
 
 // ---- private helpers ----------------------------------------------------

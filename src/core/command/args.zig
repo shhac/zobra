@@ -72,6 +72,7 @@ pub const ArgsValidator = union(enum) {
             ),
             .only_valid => for (args) |a| {
                 if (!stringInSlice(a, valid_args)) {
+                    if (diag) |d| d.valid_values = valid_args;
                     return failWithCmd(allocator, diag, "invalid argument \"{s}\"", .{a}, command_path);
                 }
             },

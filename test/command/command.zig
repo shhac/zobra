@@ -52,6 +52,46 @@ test "Command: addCommand transfers ownership" {
     try testing.expect(child.parent == root);
 }
 
+test "Command: addCommand rejects already-parented child (memory-safety)" {
+    const gpa = testing.allocator;
+    const root_a = try Command.init(gpa, .{ .use = "a" });
+    defer root_a.deinit();
+    const root_b = try Command.init(gpa, .{ .use = "b" });
+    defer root_b.deinit();
+    const child = try Command.init(gpa, .{ .use = "child" });
+    try root_a.addCommand(child); // ownership transferred to root_a
+    // root_b.addCommand(child) would put `child` in two children lists —
+    // double-free hazard on deinit. Must error.
+    try testing.expectError(error.AlreadyParented, root_b.addCommand(child));
+}
+
+test "Command: addCommand rejects self as child" {
+    const gpa = testing.allocator;
+    const root = try Command.init(gpa, .{ .use = "root" });
+    defer root.deinit();
+    try testing.expectError(error.SelfParent, root.addCommand(root));
+}
+
+test "Command: argsLenAtDash exposes positionals-before-dash" {
+    const gpa = testing.allocator;
+    const Capture = struct {
+        var value: ?usize = null;
+        fn run(cmd: *Command, _: []const []const u8) anyerror!void {
+            value = cmd.argsLenAtDash();
+        }
+    };
+    Capture.value = null;
+
+    const root = try Command.init(gpa, .{
+        .use = "tool",
+        .args = args_mod.arbitrary,
+        .run_e = Capture.run,
+    });
+    defer root.deinit();
+    try root.execute(&.{ "a", "b", "--", "c", "d" }, null);
+    try testing.expectEqual(@as(?usize, 2), Capture.value);
+}
+
 // ---- findCommand --------------------------------------------------------
 
 test "Command: findCommand resolves children by name" {
