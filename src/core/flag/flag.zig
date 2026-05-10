@@ -45,7 +45,13 @@ pub const ValueType = enum {
     duration, // *i64 — nanoseconds, matches Go's time.Duration
     string_slice, // *[]const []const u8 — CSV-split, append-on-repeat
     string_array, // *[]const []const u8 — no split, append-on-repeat
-    int_slice, // *[]const i64 — decimal only (pflag uses Atoi)
+    int_slice, // *[]const i64 — Atoi (pflag's intSlice)
+    int32_slice, // *[]const i32 — Atoi
+    int64_slice, // *[]const i64 — ParseInt(base=0)
+    float32_slice, // *[]const f32 — ParseFloat
+    float64_slice, // *[]const f64 — ParseFloat
+    bool_slice, // *[]const bool — ParseBool
+    duration_slice, // *[]const i64 — time.ParseDuration, ns
 
     pub fn isBoolean(self: ValueType) bool {
         return self == .bool;
@@ -56,7 +62,10 @@ pub const ValueType = enum {
     }
 
     pub fn isSliceLike(self: ValueType) bool {
-        return self == .string_slice or self == .string_array or self == .int_slice;
+        return switch (self) {
+            .string_slice, .string_array, .int_slice, .int32_slice, .int64_slice, .float32_slice, .float64_slice, .bool_slice, .duration_slice => true,
+            else => false,
+        };
     }
 };
 
@@ -357,6 +366,72 @@ pub const FlagSet = struct {
         usage: []const u8,
     ) !void {
         try self.registerSliceLike(i64, .int_slice, ptr, name, shorthand, default, usage);
+    }
+
+    pub fn int32SliceVarP(
+        self: *FlagSet,
+        ptr: *[]const i32,
+        name: []const u8,
+        shorthand: u8,
+        default: []const i32,
+        usage: []const u8,
+    ) !void {
+        try self.registerSliceLike(i32, .int32_slice, ptr, name, shorthand, default, usage);
+    }
+
+    pub fn int64SliceVarP(
+        self: *FlagSet,
+        ptr: *[]const i64,
+        name: []const u8,
+        shorthand: u8,
+        default: []const i64,
+        usage: []const u8,
+    ) !void {
+        try self.registerSliceLike(i64, .int64_slice, ptr, name, shorthand, default, usage);
+    }
+
+    pub fn float32SliceVarP(
+        self: *FlagSet,
+        ptr: *[]const f32,
+        name: []const u8,
+        shorthand: u8,
+        default: []const f32,
+        usage: []const u8,
+    ) !void {
+        try self.registerSliceLike(f32, .float32_slice, ptr, name, shorthand, default, usage);
+    }
+
+    pub fn float64SliceVarP(
+        self: *FlagSet,
+        ptr: *[]const f64,
+        name: []const u8,
+        shorthand: u8,
+        default: []const f64,
+        usage: []const u8,
+    ) !void {
+        try self.registerSliceLike(f64, .float64_slice, ptr, name, shorthand, default, usage);
+    }
+
+    pub fn boolSliceVarP(
+        self: *FlagSet,
+        ptr: *[]const bool,
+        name: []const u8,
+        shorthand: u8,
+        default: []const bool,
+        usage: []const u8,
+    ) !void {
+        try self.registerSliceLike(bool, .bool_slice, ptr, name, shorthand, default, usage);
+    }
+
+    pub fn durationSliceVarP(
+        self: *FlagSet,
+        ptr: *[]const i64,
+        name: []const u8,
+        shorthand: u8,
+        default: []const i64,
+        usage: []const u8,
+    ) !void {
+        try self.registerSliceLike(i64, .duration_slice, ptr, name, shorthand, default, usage);
     }
 
     fn registerSliceLike(
@@ -663,7 +738,104 @@ fn setStored(
         .string_slice => bindStringSlice(allocator, flag, value, diag),
         .string_array => bindStringArray(allocator, flag, value, diag),
         .int_slice => bindIntSlice(allocator, flag, value, diag),
+        .int32_slice => bindNumericSlice(allocator, i32, flag, value, diag, .signed, "Atoi"),
+        .int64_slice => bindNumericSlice(allocator, i64, flag, value, diag, .signed, "ParseInt"),
+        .float32_slice => bindNumericSlice(allocator, f32, flag, value, diag, .float, "ParseFloat"),
+        .float64_slice => bindNumericSlice(allocator, f64, flag, value, diag, .float, "ParseFloat"),
+        .bool_slice => bindBoolSlice(allocator, flag, value, diag),
+        .duration_slice => bindDurationSlice(allocator, flag, value, diag),
     };
+}
+
+const SliceParseKind = enum { signed, float };
+
+fn bindNumericSlice(
+    allocator: std.mem.Allocator,
+    comptime T: type,
+    flag: *Flag,
+    value: []const u8,
+    diag: ?*Diagnostic,
+    comptime kind: SliceParseKind,
+    comptime func_name: []const u8,
+) (errors.FlagError || std.mem.Allocator.Error)!void {
+    var pieces: std.ArrayListUnmanaged(T) = .empty;
+    defer pieces.deinit(allocator);
+
+    const ptr: *[]const T = @ptrCast(@alignCast(flag.value_ptr));
+    const old = ptr.*;
+    if (flag.changed) try pieces.appendSlice(allocator, old);
+
+    var it = std.mem.splitScalar(u8, value, ',');
+    while (it.next()) |s| {
+        const n: T = switch (kind) {
+            .signed => coerce.parseSignedInt(T, s) catch |err| {
+                return failCoerce(allocator, flag, s, diag, func_name, coerce.intCause(err));
+            },
+            .float => coerce.parseFloat(T, s) catch |err| {
+                return failCoerce(allocator, flag, s, diag, func_name, coerce.floatCause(err));
+            },
+        };
+        try pieces.append(allocator, n);
+    }
+
+    const owned = try pieces.toOwnedSlice(allocator);
+    if (flag.owns_value_storage) allocator.free(old);
+    ptr.* = owned;
+}
+
+fn bindBoolSlice(
+    allocator: std.mem.Allocator,
+    flag: *Flag,
+    value: []const u8,
+    diag: ?*Diagnostic,
+) (errors.FlagError || std.mem.Allocator.Error)!void {
+    var pieces: std.ArrayListUnmanaged(bool) = .empty;
+    defer pieces.deinit(allocator);
+
+    const ptr: *[]const bool = @ptrCast(@alignCast(flag.value_ptr));
+    const old = ptr.*;
+    if (flag.changed) try pieces.appendSlice(allocator, old);
+
+    var it = std.mem.splitScalar(u8, value, ',');
+    while (it.next()) |s| {
+        const b = coerce.parseBool(s) catch return failCoerce(allocator, flag, s, diag, "ParseBool", .invalid_syntax);
+        try pieces.append(allocator, b);
+    }
+
+    const owned = try pieces.toOwnedSlice(allocator);
+    if (flag.owns_value_storage) allocator.free(old);
+    ptr.* = owned;
+}
+
+fn bindDurationSlice(
+    allocator: std.mem.Allocator,
+    flag: *Flag,
+    value: []const u8,
+    diag: ?*Diagnostic,
+) (errors.FlagError || std.mem.Allocator.Error)!void {
+    var pieces: std.ArrayListUnmanaged(i64) = .empty;
+    defer pieces.deinit(allocator);
+
+    const ptr: *[]const i64 = @ptrCast(@alignCast(flag.value_ptr));
+    const old = ptr.*;
+    if (flag.changed) try pieces.appendSlice(allocator, old);
+
+    var it = std.mem.splitScalar(u8, value, ',');
+    while (it.next()) |s| {
+        const r = duration.parse(s);
+        switch (r) {
+            .ok => |ns| try pieces.append(allocator, ns),
+            .err => |e| {
+                const msg = duration.renderError(allocator, e, s) catch return error.TypeCoercionFailed;
+                defer allocator.free(msg);
+                return failCoerceWithRendered(allocator, flag, s, diag, msg);
+            },
+        }
+    }
+
+    const owned = try pieces.toOwnedSlice(allocator);
+    if (flag.owns_value_storage) allocator.free(old);
+    ptr.* = owned;
 }
 
 fn bindStringSlice(
@@ -754,8 +926,24 @@ fn freeSliceStorage(allocator: std.mem.Allocator, flag: *Flag) void {
             const p: *[]const []const u8 = @ptrCast(@alignCast(flag.value_ptr));
             allocator.free(p.*);
         },
-        .int_slice => {
+        .int_slice, .int64_slice, .duration_slice => {
             const p: *[]const i64 = @ptrCast(@alignCast(flag.value_ptr));
+            allocator.free(p.*);
+        },
+        .int32_slice => {
+            const p: *[]const i32 = @ptrCast(@alignCast(flag.value_ptr));
+            allocator.free(p.*);
+        },
+        .float32_slice => {
+            const p: *[]const f32 = @ptrCast(@alignCast(flag.value_ptr));
+            allocator.free(p.*);
+        },
+        .float64_slice => {
+            const p: *[]const f64 = @ptrCast(@alignCast(flag.value_ptr));
+            allocator.free(p.*);
+        },
+        .bool_slice => {
+            const p: *[]const bool = @ptrCast(@alignCast(flag.value_ptr));
             allocator.free(p.*);
         },
         else => {},
@@ -772,6 +960,8 @@ fn renderSliceDefault(comptime Elem: type, allocator: std.mem.Allocator, slice: 
         if (i > 0) try w.writeByte(',');
         if (Elem == []const u8) {
             try w.writeAll(item);
+        } else if (Elem == bool) {
+            try w.writeAll(if (item) "true" else "false");
         } else {
             try w.print("{d}", .{item});
         }
