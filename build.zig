@@ -9,6 +9,17 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
+    // Satellite module: doc generators (markdown/yaml/rest/man).
+    // Lives behind a separate import so consumers who don't need
+    // doc generation pay no compile cost for them.
+    const zobra_doc_mod = b.addModule("zobra-doc", .{
+        .root_source_file = b.path("src/doc/root.zig"),
+        .target = target,
+        .imports = &.{
+            .{ .name = "zobra", .module = zobra_mod },
+        },
+    });
+
     const example_exe = b.addExecutable(.{
         .name = "zobra-example",
         .root_module = b.createModule(.{
@@ -31,12 +42,16 @@ pub fn build(b: *std.Build) void {
     const lib_tests = b.addTest(.{ .root_module = zobra_mod });
     const run_lib_tests = b.addRunArtifact(lib_tests);
 
+    const doc_tests = b.addTest(.{ .root_module = zobra_doc_mod });
+    const run_doc_tests = b.addRunArtifact(doc_tests);
+
     const integration_mod = b.createModule(.{
         .root_source_file = b.path("test/all.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "zobra", .module = zobra_mod },
+            .{ .name = "zobra-doc", .module = zobra_doc_mod },
         },
     });
     const integration_tests = b.addTest(.{ .root_module = integration_mod });
@@ -44,5 +59,6 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_lib_tests.step);
+    test_step.dependOn(&run_doc_tests.step);
     test_step.dependOn(&run_integration_tests.step);
 }
