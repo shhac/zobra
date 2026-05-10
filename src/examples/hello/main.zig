@@ -48,10 +48,23 @@ pub fn main(init: std.process.Init) !void {
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const stdout = &stdout_file_writer.interface;
+    var stderr_buffer: [4096]u8 = undefined;
+    var stderr_file_writer: Io.File.Writer = .init(.stderr(), io, &stderr_buffer);
+    const stderr = &stderr_file_writer.interface;
 
-    root.executeWith(argv, .{ .out_writer = stdout }) catch |err| {
-        std.debug.print("error: {s}\n", .{@errorName(err)});
+    root.setOut(stdout);
+    root.setErr(stderr);
+
+    // executeAndPrint matches cobra's `Execute()`: on failure, prints
+    // `Error: <msg>\n` + the resolved command's usage block to err_writer
+    // (toggle with .silence_errors / .silence_usage on the Options),
+    // then propagates the error so the caller decides the exit code.
+    root.executeAndPrint(argv) catch |err| {
+        try stdout.flush();
+        try stderr.flush();
+        if (err == error.HelpRequested or err == error.VersionRequested) std.process.exit(0);
         std.process.exit(1);
     };
     try stdout.flush();
+    try stderr.flush();
 }

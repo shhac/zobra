@@ -72,6 +72,75 @@ test "Command: addCommand rejects self as child" {
     try testing.expectError(error.SelfParent, root.addCommand(root));
 }
 
+test "Command: executeAndPrint writes Error: + usage on parse error" {
+    const gpa = testing.allocator;
+    var err_aw: std.Io.Writer.Allocating = .init(gpa);
+    defer err_aw.deinit();
+
+    const root = try Command.init(gpa, .{ .use = "tool", .run_e = noopRun });
+    defer root.deinit();
+    root.setErr(&err_aw.writer);
+
+    try testing.expectError(error.UnknownFlag, root.executeAndPrint(&.{"--unknown"}));
+    const out = err_aw.writer.buffered();
+    try testing.expect(std.mem.indexOf(u8, out, "Error: unknown flag: --unknown") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Usage:") != null);
+}
+
+test "Command: silence_errors suppresses the Error: line" {
+    const gpa = testing.allocator;
+    var err_aw: std.Io.Writer.Allocating = .init(gpa);
+    defer err_aw.deinit();
+
+    const root = try Command.init(gpa, .{
+        .use = "tool",
+        .silence_errors = true,
+        .run_e = noopRun,
+    });
+    defer root.deinit();
+    root.setErr(&err_aw.writer);
+
+    try testing.expectError(error.UnknownFlag, root.executeAndPrint(&.{"--unknown"}));
+    const out = err_aw.writer.buffered();
+    try testing.expect(std.mem.indexOf(u8, out, "Error:") == null);
+    // Usage still printed.
+    try testing.expect(std.mem.indexOf(u8, out, "Usage:") != null);
+}
+
+test "Command: silence_usage suppresses the usage block" {
+    const gpa = testing.allocator;
+    var err_aw: std.Io.Writer.Allocating = .init(gpa);
+    defer err_aw.deinit();
+
+    const root = try Command.init(gpa, .{
+        .use = "tool",
+        .silence_usage = true,
+        .run_e = noopRun,
+    });
+    defer root.deinit();
+    root.setErr(&err_aw.writer);
+
+    try testing.expectError(error.UnknownFlag, root.executeAndPrint(&.{"--unknown"}));
+    const out = err_aw.writer.buffered();
+    try testing.expect(std.mem.indexOf(u8, out, "Error:") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Usage:") == null);
+}
+
+test "Command: setOut/setErr inherit from parent" {
+    const gpa = testing.allocator;
+    var err_aw: std.Io.Writer.Allocating = .init(gpa);
+    defer err_aw.deinit();
+
+    const root = try Command.init(gpa, .{ .use = "tool" });
+    defer root.deinit();
+    root.setErr(&err_aw.writer);
+
+    const child = try Command.init(gpa, .{ .use = "child", .run_e = noopRun });
+    try root.addCommand(child);
+    // Child inherits root's err_writer via outWriter/errWriter walks.
+    try testing.expect(child.errWriter() == &err_aw.writer);
+}
+
 test "Command: argsLenAtDash exposes positionals-before-dash" {
     const gpa = testing.allocator;
     const Capture = struct {

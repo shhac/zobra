@@ -117,6 +117,16 @@ pub const Command = struct {
     /// whatever it points to.
     context: ?*anyopaque,
 
+    /// Default writers (cobra's SetOut / SetErr). When `executeAndPrint`
+    /// catches an error or the help/version path needs to render, the
+    /// effective writers are looked up via outWriter() / errWriter()
+    /// which walk the parent chain. Default behaviour with both null:
+    /// help goes to opts.out_writer (per executeWith); errors via
+    /// executeAndPrint propagate without printing. Setting at root is
+    /// the typical pattern.
+    out_writer: ?*std.Io.Writer,
+    err_writer: ?*std.Io.Writer,
+
     /// Storage for the auto-injected --help flag's value. Per-command;
     /// cobra calls this lazily in execute (`InitDefaultHelpFlag`). We do
     /// the same in `execute()`. False until the user passes --help / -h.
@@ -172,6 +182,8 @@ pub const Command = struct {
             .one_required_groups = .empty,
             .mutex_groups = .empty,
             .context = null,
+            .out_writer = null,
+            .err_writer = null,
             .help_flag_value = false,
             .help_flag_initialised = false,
             .version_flag_value = false,
@@ -283,6 +295,37 @@ pub const Command = struct {
     /// Borrow-only.
     pub fn bindContext(self: *Command, ctx: *anyopaque) void {
         self.context = ctx;
+    }
+
+    /// cobra's Command.SetOut — store the writer that help / version
+    /// output goes to when executeWith doesn't override via opts. Borrow-
+    /// only; the user owns the writer's lifetime.
+    pub fn setOut(self: *Command, w: *std.Io.Writer) void {
+        self.out_writer = w;
+    }
+
+    /// cobra's Command.SetErr — store the writer that auto-printed
+    /// errors go to from `executeAndPrint`. Borrow-only.
+    pub fn setErr(self: *Command, w: *std.Io.Writer) void {
+        self.err_writer = w;
+    }
+
+    /// Walk the parent chain for the first non-null `out_writer`. Cobra
+    /// users typically setOut at root only; descendants inherit.
+    pub fn outWriter(self: *const Command) ?*std.Io.Writer {
+        var p: ?*const Command = self;
+        while (p) |c| : (p = c.parent) {
+            if (c.out_writer) |w| return w;
+        }
+        return null;
+    }
+
+    pub fn errWriter(self: *const Command) ?*std.Io.Writer {
+        var p: ?*const Command = self;
+        while (p) |c| : (p = c.parent) {
+            if (c.err_writer) |w| return w;
+        }
+        return null;
     }
 
     pub const AddCommandError = error{
@@ -505,6 +548,50 @@ pub const Command = struct {
     /// diagnostic" call.
     pub fn execute(self: *Command, argv: []const []const u8, diag: ?*Diagnostic) !void {
         return self.executeWith(argv, .{ .diag = diag });
+    }
+
+    /// cobra's Command.Execute — wraps `executeWith` with the
+    /// auto-print-on-error behaviour: when execution fails AND
+    /// silence_errors is false, prints `Error: <msg>\n` to err_writer;
+    /// when silence_usage is also false, prints the resolved command's
+    /// usage block. Returns the error (the caller decides whether to
+    /// exit non-zero).
+    ///
+    /// Mirrors cobra's `*FlagSet.errorHandling = ContinueOnError`
+    /// behaviour where the error-propagation is decoupled from the
+    /// printing — zobra always returns errors; auto-print is what
+    /// distinguishes executeAndPrint from execute / executeWith.
+    pub fn executeAndPrint(self: *Command, argv: []const []const u8) !void {
+        var diag: Diagnostic = .{};
+        defer diag.deinit(self.allocator);
+
+        self.executeWith(argv, .{
+            .diag = &diag,
+            .out_writer = self.outWriter(),
+        }) catch |err| {
+            if (err == error.HelpRequested or err == error.VersionRequested) return err;
+            try self.printErrorAndUsage(err, &diag);
+            return err;
+        };
+    }
+
+    fn printErrorAndUsage(self: *Command, err: anyerror, diag: *Diagnostic) !void {
+        const w = self.errWriter() orelse return;
+        if (!self.silence_errors) {
+            const msg = if (diag.message) |m| m else @errorName(err);
+            try w.print("Error: {s}\n", .{msg});
+        }
+        if (!self.silence_usage) {
+            // Find the command that the error happened at so we print
+            // its usage (not the root's, if a deeper failure).
+            const usage_target = if (self.findCommand(self.allocator, &.{}, null)) |found| blk: {
+                self.allocator.free(found.remaining);
+                break :blk found.cmd;
+            } else |_| self;
+            const usage = try usage_target.usageString(self.allocator);
+            defer self.allocator.free(usage);
+            try w.writeAll(usage);
+        }
     }
 
     pub fn executeWith(self: *Command, argv: []const []const u8, opts: ExecuteOptions) !void {
