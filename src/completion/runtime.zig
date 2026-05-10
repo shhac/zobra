@@ -9,9 +9,11 @@
 const std = @import("std");
 const zobra = @import("zobra");
 const directive_mod = @import("directive.zig");
+const options_mod = @import("options.zig");
 
 pub const Command = zobra.Command;
 pub const ShellCompDirective = directive_mod.ShellCompDirective;
+pub const CompletionOptions = options_mod.CompletionOptions;
 
 /// Per-command callback returning positional-argument completions.
 /// `cmd` is the resolved command; `args` is the positional args
@@ -56,48 +58,40 @@ pub fn completeCommand(
     argv: []const []const u8,
     w: *std.Io.Writer,
 ) !void {
-    // The last argv element is the partial token under cursor; the
-    // rest are the args already entered.
     const to_complete = if (argv.len > 0) argv[argv.len - 1] else "";
     const earlier = if (argv.len > 0) argv[0 .. argv.len - 1] else &.{};
 
-    // Resolve the deepest matching subcommand from earlier args.
-    const found = try root.findCommand(allocator, earlier, null);
+    // If `--` appeared earlier, subsequent tokens are positional-only;
+    // flag-name candidates would be wrong. Cobra's bash V2 handler does
+    // the same separation.
+    const after_double_dash = sliceContains(earlier, "--");
+
+    // Skip `--` when resolving the command — findCommand doesn't model
+    // the pflag separator and would treat it as a command name.
+    const command_argv = stripDoubleDash(earlier);
+    const found = try root.findCommand(allocator, command_argv, null);
     defer allocator.free(found.remaining);
     const cmd = found.cmd;
 
     var candidates: std.ArrayListUnmanaged(Completions.Candidate) = .empty;
     defer candidates.deinit(allocator);
-    // Flag candidates allocate their `value` (e.g. "--verbose"); track
-    // those for freeing after emission.
     var owned_values: std.ArrayListUnmanaged([]const u8) = .empty;
     defer {
         for (owned_values.items) |v| allocator.free(v);
         owned_values.deinit(allocator);
     }
 
-    if (to_complete.len > 0 and to_complete[0] == '-') {
+    // If the partial token contains `=`, the user is typing a flag value
+    // (`--name=...`). Drop flag-name candidates entirely; we don't
+    // currently dispatch to a flag-value completer, so emitting nothing
+    // with `:NoFileComp` lets the shell fall through to file completion
+    // (a reasonable default that matches cobra when no callback is set).
+    const looks_like_flag_value = to_complete.len > 0 and to_complete[0] == '-' and std.mem.indexOfScalar(u8, to_complete, '=') != null;
+
+    if (to_complete.len > 0 and to_complete[0] == '-' and !after_double_dash and !looks_like_flag_value) {
         try collectFlagCandidates(cmd, to_complete, allocator, &candidates, &owned_values);
-    } else {
-        // Subcommand candidates first.
-        for (cmd.children.items) |child| {
-            if (child.hidden) continue;
-            const name = child.commandName();
-            if (std.mem.eql(u8, name, "__complete")) continue;
-            if (std.mem.eql(u8, name, "__completeNoDesc")) continue;
-            if (std.mem.startsWith(u8, name, to_complete)) {
-                try candidates.append(allocator, .{
-                    .value = name,
-                    .description = child.short,
-                });
-            }
-        }
-        // Static `valid_args` candidates from the resolved command.
-        for (cmd.valid_args) |v| {
-            if (std.mem.startsWith(u8, v, to_complete)) {
-                try candidates.append(allocator, .{ .value = v });
-            }
-        }
+    } else if (!looks_like_flag_value) {
+        try collectSubcommandAndArgCandidates(cmd, to_complete, allocator, &candidates);
     }
 
     for (candidates.items) |c| {
@@ -109,6 +103,40 @@ pub fn completeCommand(
     }
     try ShellCompDirective.format(ShellCompDirective.NoFileComp, w);
     try w.writeByte('\n');
+}
+
+fn sliceContains(haystack: []const []const u8, needle: []const u8) bool {
+    for (haystack) |s| if (std.mem.eql(u8, s, needle)) return true;
+    return false;
+}
+
+fn stripDoubleDash(args: []const []const u8) []const []const u8 {
+    for (args, 0..) |a, i| {
+        if (std.mem.eql(u8, a, "--")) return args[0..i];
+    }
+    return args;
+}
+
+fn collectSubcommandAndArgCandidates(
+    cmd: *const Command,
+    to_complete: []const u8,
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(Completions.Candidate),
+) !void {
+    for (cmd.children.items) |child| {
+        if (child.hidden) continue;
+        const name = child.commandName();
+        if (std.mem.eql(u8, name, "__complete")) continue;
+        if (std.mem.eql(u8, name, "__completeNoDesc")) continue;
+        if (std.mem.startsWith(u8, name, to_complete)) {
+            try out.append(allocator, .{ .value = name, .description = child.short });
+        }
+    }
+    for (cmd.valid_args) |v| {
+        if (std.mem.startsWith(u8, v, to_complete)) {
+            try out.append(allocator, .{ .value = v });
+        }
+    }
 }
 
 fn collectFlagCandidates(
@@ -139,27 +167,24 @@ fn collectFlagCandidates(
 /// generates its respective script when run. The hidden `__complete`
 /// subcommand is what those generated scripts call back into.
 ///
-/// Skips installation when CompletionOptions.disable_default_cmd is true.
-pub fn installCompletionCommand(root: *Command, opts: anytype) !void {
-    _ = opts; // CompletionOptions; for now we don't expose toggles —
-    // the auto-registration is unconditional except for an explicit
-    // user-registered `completion`. Future polish: read .disable_default_cmd.
+/// Toggles via `CompletionOptions`:
+/// - `disable_default_cmd`: skip the `completion` subcommand entirely.
+///   The hidden `__complete` runtime is still installed so shell
+///   scripts that the user generated via the public `genXCompletion`
+///   functions can still call back into the binary.
+/// - `hidden_default_cmd`: register `completion` but hide it from help.
+pub fn installCompletionCommand(root: *Command, opts: CompletionOptions) !void {
     if (root.findChildByNameOrAlias("completion") != null) return;
 
-    const completion = try Command.init(root.allocator, .{
-        .use = "completion",
-        .short = "Generate shell completion scripts",
-        .long = "Generate shell completion scripts. To load completions:\n  bash:        eval \"$(... completion bash)\"\n  zsh:         eval \"$(... completion zsh)\"\n  fish:        ... completion fish | source\n  powershell:  ... completion powershell | Invoke-Expression",
-    });
-    try root.addCommand(completion);
-
-    inline for (.{ "bash", "zsh", "fish", "powershell" }) |shell_name| {
-        const sub = try Command.init(root.allocator, .{
-            .use = shell_name,
-            .short = "Generate " ++ shell_name ++ " completion script",
-            .run_e = ShellRun.shellRunFor(shell_name),
+    if (!opts.disable_default_cmd) {
+        const completion = try Command.init(root.allocator, .{
+            .use = "completion",
+            .short = "Generate shell completion scripts",
+            .long = "Generate shell completion scripts. To load completions:\n  bash:        eval \"$(... completion bash)\"\n  zsh:         eval \"$(... completion zsh)\"\n  fish:        ... completion fish | source\n  powershell:  ... completion powershell | Invoke-Expression",
+            .hidden = opts.hidden_default_cmd,
         });
-        try completion.addCommand(sub);
+        try root.addCommand(completion);
+        try installShellChildren(completion);
     }
 
     if (root.findChildByNameOrAlias("__complete") == null) {
@@ -177,6 +202,17 @@ fn completeCmdRun(cmd: *Command, run_args: []const []const u8) anyerror!void {
     const root = if (cmd.parent) |p| p else cmd;
     const w = root.outWriter() orelse return;
     try completeCommand(cmd.allocator, root, run_args, w);
+}
+
+fn installShellChildren(completion: *Command) !void {
+    inline for (.{ "bash", "zsh", "fish", "powershell" }) |shell_name| {
+        const sub = try Command.init(completion.allocator, .{
+            .use = shell_name,
+            .short = "Generate " ++ shell_name ++ " completion script",
+            .run_e = ShellRun.shellRunFor(shell_name),
+        });
+        try completion.addCommand(sub);
+    }
 }
 
 /// Internal: per-shell Run handler that calls the right generator

@@ -197,3 +197,87 @@ test "completion: bash subcommand prints bash script through configured writer" 
     const out = aw.writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "complete -F __kt_get_completions kt") != null);
 }
+
+test "completion runtime: bare '-' lists every non-hidden long flag" {
+    const gpa = std.testing.allocator;
+    const root = try Command.init(gpa, .{ .use = "tool", .run_e = noopRun });
+    defer root.deinit();
+
+    var verbose: bool = false;
+    var quiet: bool = false;
+    try root.flags().boolVarP(&verbose, "verbose", 'v', false, "Verbose");
+    try root.flags().boolVarP(&quiet, "quiet", 'q', false, "Quiet");
+
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try completion.completeCommand(gpa, root, &.{"-"}, &aw.writer);
+    const out = aw.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "--verbose") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "--quiet") != null);
+}
+
+test "completion runtime: '--flag=' is treated as a value request — emits no flag candidates" {
+    const gpa = std.testing.allocator;
+    const root = try Command.init(gpa, .{ .use = "tool", .run_e = noopRun });
+    defer root.deinit();
+
+    var verbose: bool = false;
+    try root.flags().boolVarP(&verbose, "verbose", 'v', false, "Verbose");
+
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try completion.completeCommand(gpa, root, &.{"--verbose="}, &aw.writer);
+    const out = aw.writer.buffered();
+    // No `--verbose` candidate; shell falls through to default
+    // file-completion behaviour via the directive.
+    try std.testing.expect(std.mem.indexOf(u8, out, "--verbose") == null);
+    try std.testing.expectEqualStrings(":4\n", out);
+}
+
+test "completion runtime: tokens after '--' are positional — no flag candidates emitted" {
+    const gpa = std.testing.allocator;
+    const root = try Command.init(gpa, .{ .use = "tool", .run_e = noopRun });
+    defer root.deinit();
+
+    var xenon: bool = false;
+    try root.flags().boolVarP(&xenon, "xenon", 'x', false, "X");
+
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try completion.completeCommand(gpa, root, &.{ "--", "-x" }, &aw.writer);
+    const out = aw.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "--xenon") == null);
+}
+
+test "completion runtime: empty argv emits root subcommands" {
+    const gpa = std.testing.allocator;
+    const root = try Command.init(gpa, .{ .use = "tool" });
+    defer root.deinit();
+    try root.addCommand(try Command.init(gpa, .{ .use = "greet", .short = "Greet", .run_e = noopRun }));
+
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try completion.completeCommand(gpa, root, &.{}, &aw.writer);
+    const out = aw.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "greet") != null);
+}
+
+test "installCompletionCommand: disable_default_cmd skips `completion` but keeps `__complete`" {
+    const gpa = std.testing.allocator;
+    const root = try Command.init(gpa, .{ .use = "tool" });
+    defer root.deinit();
+    try completion.installCompletionCommand(root, .{ .disable_default_cmd = true });
+
+    try std.testing.expect(root.findChildByNameOrAlias("completion") == null);
+    try std.testing.expect(root.findChildByNameOrAlias("__complete") != null);
+}
+
+test "installCompletionCommand: hidden_default_cmd marks `completion` hidden" {
+    const gpa = std.testing.allocator;
+    const root = try Command.init(gpa, .{ .use = "tool" });
+    defer root.deinit();
+    try completion.installCompletionCommand(root, .{ .hidden_default_cmd = true });
+
+    const c = root.findChildByNameOrAlias("completion") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(c.hidden);
+}

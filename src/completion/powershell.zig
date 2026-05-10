@@ -10,28 +10,16 @@ pub fn genPowerShellCompletion(
     root: *const zobra.Command,
     w: *std.Io.Writer,
 ) !void {
-    return genPowerShell(allocator, root, w, true);
-}
-
-pub fn genPowerShellCompletionWithDesc(
-    allocator: std.mem.Allocator,
-    root: *const zobra.Command,
-    w: *std.Io.Writer,
-) !void {
-    return genPowerShell(allocator, root, w, true);
-}
-
-fn genPowerShell(
-    allocator: std.mem.Allocator,
-    root: *const zobra.Command,
-    w: *std.Io.Writer,
-    descriptions: bool,
-) !void {
     _ = allocator;
-    _ = descriptions;
     const name = root.commandName();
     try w.print(template, .{ .name = name });
 }
+
+/// Cobra exposes a `WithDesc` variant that emits descriptions in the
+/// generated script. zobra's PowerShell template already emits the
+/// description field unconditionally — the two functions are identical.
+/// Alias provided for cobra-parity callers.
+pub const genPowerShellCompletionWithDesc = genPowerShellCompletion;
 
 const template =
     \\# PowerShell completion for {[name]s}
