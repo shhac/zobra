@@ -19,6 +19,7 @@ const parser_mod = @import("../parser/parser.zig");
 const args_mod = @import("args.zig");
 const hook_mod = @import("hook.zig");
 const suggest_mod = @import("suggest.zig");
+const groups_mod = @import("groups.zig");
 const help_mod = @import("../help/help.zig");
 
 pub const FlagSet = flag_mod.FlagSet;
@@ -826,73 +827,7 @@ pub const Command = struct {
     }
 
     fn validateFlagGroups(self: *const Command, diag: ?*Diagnostic) errors.FlagError!void {
-        try self.validateRequiredTogether(diag);
-        try self.validateOneRequired(diag);
-        try self.validateMutex(diag);
-    }
-
-    fn flagChanged(self: *const Command, name: []const u8) bool {
-        const f = self.lookupLong(name) orelse return false;
-        return f.changed;
-    }
-
-    fn validateRequiredTogether(self: *const Command, diag: ?*Diagnostic) errors.FlagError!void {
-        for (self.required_together_groups.items) |group| {
-            var unset: std.ArrayListUnmanaged([]const u8) = .empty;
-            defer unset.deinit(self.allocator);
-            var set_count: usize = 0;
-            for (group) |name| {
-                if (self.flagChanged(name)) {
-                    set_count += 1;
-                } else {
-                    unset.append(self.allocator, name) catch return error.FlagGroupViolation;
-                }
-            }
-            if (set_count == 0 or unset.items.len == 0) continue;
-            return failGroup(
-                self.allocator,
-                diag,
-                "if any flags in the group [{group}] are set they must all be set; missing [{names}]",
-                group,
-                unset.items,
-            );
-        }
-    }
-
-    fn validateOneRequired(self: *const Command, diag: ?*Diagnostic) errors.FlagError!void {
-        for (self.one_required_groups.items) |group| {
-            var any_set = false;
-            for (group) |name| if (self.flagChanged(name)) {
-                any_set = true;
-                break;
-            };
-            if (any_set) continue;
-            return failGroup(
-                self.allocator,
-                diag,
-                "at least one of the flags in the group [{group}] is required",
-                group,
-                &.{},
-            );
-        }
-    }
-
-    fn validateMutex(self: *const Command, diag: ?*Diagnostic) errors.FlagError!void {
-        for (self.mutex_groups.items) |group| {
-            var set: std.ArrayListUnmanaged([]const u8) = .empty;
-            defer set.deinit(self.allocator);
-            for (group) |name| if (self.flagChanged(name)) {
-                set.append(self.allocator, name) catch return error.FlagGroupViolation;
-            };
-            if (set.items.len <= 1) continue;
-            return failGroup(
-                self.allocator,
-                diag,
-                "if any flags in the group [{group}] are set none of the others can be; [{names}] were all set",
-                group,
-                set.items,
-            );
-        }
+        return groups_mod.validate(self, diag);
     }
 
     fn applyTokens(
@@ -1106,77 +1041,6 @@ fn renderParseDiag(allocator: Allocator, diag: *Diagnostic) !void {
         else => return,
     };
     diag.setOwnedMessage(allocator, rendered);
-}
-
-// ---- private helpers ----------------------------------------------------
-
-/// Render a flag-group violation message and stash it on the diagnostic.
-/// Format mirrors cobra's `[a b c]` (space-separated, square-bracketed).
-fn failGroup(
-    allocator: Allocator,
-    diag: ?*Diagnostic,
-    template: []const u8,
-    group: []const []const u8,
-    names: []const []const u8,
-) errors.FlagError {
-    const group_str = joinSpaceSeparated(allocator, group) catch return error.FlagGroupViolation;
-    defer allocator.free(group_str);
-    const names_str = joinSpaceSeparated(allocator, names) catch return error.FlagGroupViolation;
-    defer allocator.free(names_str);
-
-    const rendered = renderTemplate(allocator, template, group_str, names_str) catch return error.FlagGroupViolation;
-
-    if (diag) |d| {
-        d.category = .flag;
-        d.code = .flag_group_violation;
-        d.setOwnedMessage(allocator, rendered);
-    } else {
-        allocator.free(rendered);
-    }
-    return error.FlagGroupViolation;
-}
-
-fn joinSpaceSeparated(allocator: Allocator, names: []const []const u8) ![]u8 {
-    if (names.len == 0) return allocator.dupe(u8, "");
-
-    // Sort for deterministic output (cobra also sorts).
-    const sorted = try allocator.dupe([]const u8, names);
-    defer allocator.free(sorted);
-    std.mem.sort([]const u8, sorted, {}, struct {
-        fn lt(_: void, a: []const u8, b: []const u8) bool {
-            return std.mem.lessThan(u8, a, b);
-        }
-    }.lt);
-
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
-    const w = &aw.writer;
-    for (sorted, 0..) |n, i| {
-        if (i > 0) try w.writeByte(' ');
-        try w.writeAll(n);
-    }
-    return aw.toOwnedSlice();
-}
-
-fn renderTemplate(allocator: Allocator, template: []const u8, group: []const u8, names: []const u8) ![]u8 {
-    // Tiny one-pass replace of {group} and {names}.
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
-    const w = &aw.writer;
-    var i: usize = 0;
-    while (i < template.len) {
-        if (i + 7 <= template.len and std.mem.eql(u8, template[i .. i + 7], "{group}")) {
-            try w.writeAll(group);
-            i += 7;
-        } else if (i + 7 <= template.len and std.mem.eql(u8, template[i .. i + 7], "{names}")) {
-            try w.writeAll(names);
-            i += 7;
-        } else {
-            try w.writeByte(template[i]);
-            i += 1;
-        }
-    }
-    return aw.toOwnedSlice();
 }
 
 // Most Command tests live in test/command/command.zig (file-decomposition

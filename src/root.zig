@@ -60,8 +60,10 @@ test {
     _ = @import("core/flag/coerce.zig");
     _ = @import("core/flag/duration.zig");
     _ = @import("core/flag/flag.zig");
+    _ = @import("core/flag/bind.zig");
     _ = @import("core/command/args.zig");
     _ = @import("core/command/command.zig");
+    _ = @import("core/command/groups.zig");
     _ = @import("core/command/hook.zig");
     _ = @import("core/command/suggest.zig");
     _ = @import("core/help/usage.zig");
