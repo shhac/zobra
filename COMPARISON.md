@@ -190,7 +190,7 @@ cmd.args = zobra.args.matchAll(&.{ zobra.args.minimumN(1), zobra.args.onlyValid 
 | `genZshCompletion`, `genFishCompletion`, `genPowerShellCompletion` | ✓ | ✓ |
 | `__complete` runtime callback | ✓ | ✓ (auto-registered hidden subcommand) |
 | `ShellCompDirective*` constants | ✓ | ✓ (`Default`, `Error`, `NoSpace`, `NoFileComp`, `FilterFileExt`, `FilterDirs`, `KeepOrder`) |
-| `CompletionOptions` (toggles) | ✓ | ✓ (struct shape; `disable_default_cmd` toggle wiring is a follow-up) |
+| `CompletionOptions` (toggles) | ✓ | ✓ (`disable_default_cmd`, `hidden_default_cmd` wired) |
 | Auto-registered `completion` subcommand | ✓ | ✓ (`installCompletionCommand`) |
 | Static `valid_args` candidate filtering | ✓ | ✓ |
 | Long-flag candidate completion (`--…`) | ✓ | ✓ |

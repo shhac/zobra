@@ -51,13 +51,10 @@ fn lessByName(_: void, a: *Command, b: *Command) bool {
 }
 
 /// Replace every space in `s` with `_` — used for filename / link
-/// derivation from command paths. Caller frees.
+/// derivation from command paths. Caller frees. Thin wrapper around
+/// `replaceSpaces` for the common case.
 pub fn underscoreSpaces(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
-    const out = try allocator.dupe(u8, s);
-    for (out) |*c| if (c.* == ' ') {
-        c.* = '_';
-    };
-    return out;
+    return replaceSpaces(allocator, s, '_');
 }
 
 /// pflag's UseLine: `cmd.use` plus " [flags]" if the command has any
