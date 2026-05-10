@@ -28,17 +28,23 @@ pub const ArgsValidator = union(enum) {
     pub const Range = struct { min: usize, max: usize };
 
     /// Validate `args` against this rule. Fills diag with cobra-style
-    /// wording on failure ("requires at least N arg(s), only received M",
-    /// etc.). Errors come from the CommandError set.
+    /// wording on failure. `command_path` and `valid_args` are passed in
+    /// (the validator itself is stateless) — cobra's wording for `noArgs`
+    /// and `onlyValid` includes the command path:
+    ///   `unknown command "X" for "tool greet"`
+    ///   `invalid argument "X" for "tool greet"`
+    /// When command_path is empty (e.g. unit test calling validate
+    /// directly) we elide the `for "…"` clause.
     pub fn validate(
         self: ArgsValidator,
         valid_args: []const []const u8,
         args: []const []const u8,
+        command_path: []const u8,
         allocator: std.mem.Allocator,
         diag: ?*Diagnostic,
     ) errors.CommandError!void {
         return switch (self) {
-            .no_args => if (args.len > 0) failWith(allocator, diag, "unknown command \"{s}\"", .{args[0]}),
+            .no_args => if (args.len > 0) failWithCmd(allocator, diag, "unknown command \"{s}\"", .{args[0]}, command_path),
             .arbitrary => {},
             .minimum_n => |n| if (args.len < n) failWith(
                 allocator,
@@ -66,11 +72,11 @@ pub const ArgsValidator = union(enum) {
             ),
             .only_valid => for (args) |a| {
                 if (!stringInSlice(a, valid_args)) {
-                    return failWith(allocator, diag, "invalid argument \"{s}\"", .{a});
+                    return failWithCmd(allocator, diag, "invalid argument \"{s}\"", .{a}, command_path);
                 }
             },
             .match_all => |list| for (list) |v| {
-                try v.validate(valid_args, args, allocator, diag);
+                try v.validate(valid_args, args, command_path, allocator, diag);
             },
         };
     }
@@ -91,6 +97,29 @@ fn failWith(
         d.category = .command;
         d.code = .args_validation_failed;
         const msg = std.fmt.allocPrint(allocator, fmt, args) catch return error.ArgsValidationFailed;
+        if (d.owns_message) if (d.message) |m| allocator.free(m);
+        d.message = msg;
+        d.owns_message = true;
+    }
+    return error.ArgsValidationFailed;
+}
+
+fn failWithCmd(
+    allocator: std.mem.Allocator,
+    diag: ?*Diagnostic,
+    comptime fmt: []const u8,
+    args: anytype,
+    command_path: []const u8,
+) errors.CommandError {
+    if (diag) |d| {
+        d.category = .command;
+        d.code = .args_validation_failed;
+        const base = std.fmt.allocPrint(allocator, fmt, args) catch return error.ArgsValidationFailed;
+        defer allocator.free(base);
+        const msg = if (command_path.len > 0)
+            std.fmt.allocPrint(allocator, "{s} for \"{s}\"", .{ base, command_path }) catch return error.ArgsValidationFailed
+        else
+            allocator.dupe(u8, base) catch return error.ArgsValidationFailed;
         if (d.owns_message) if (d.message) |m| allocator.free(m);
         d.message = msg;
         d.owns_message = true;
@@ -128,7 +157,7 @@ fn validate(v: ArgsValidator, valid: []const []const u8, args: []const []const u
     const gpa = testing.allocator;
     var diag: Diagnostic = .{};
     defer diag.deinit(gpa);
-    v.validate(valid, args, gpa, &diag) catch {
+    v.validate(valid, args, "", gpa, &diag) catch {
         // Move ownership of diag.message to the caller for inspection.
         const m = diag.message;
         diag.message = null;

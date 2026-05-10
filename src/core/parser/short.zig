@@ -27,8 +27,13 @@ pub fn parseShort(
         const c = shorthands[0];
         const rest = shorthands[1..];
 
-        // `-f=arg` form — the `=` always splits, regardless of value-taking.
-        if (rest.len > 0 and rest[0] == '=') {
+        // `-f=arg` form — pflag only treats `=` as the splitter when the
+        // shorthands suffix is at least 3 chars long (i.e. there's at
+        // least one char of value after the `=`). For `-f=` the `=` is
+        // not a splitter; falls through to the regular branches and
+        // either becomes the value (when f is value-taking) or the next
+        // shorthand char (when not).
+        if (rest.len > 1 and rest[0] == '=') {
             const v = rest[1..];
             try out.append(allocator, .{ .short = .{ .name = c, .value = v, .raw = s } });
             shorthands = "";
@@ -205,13 +210,28 @@ test "parseShort: -f without a following arg emits null value" {
     try testing.expect(r.tokens[0].short.value == null);
 }
 
-test "parseShort: -f= emits empty attached value (matches pflag)" {
+test "parseShort: -f= with non-value-taking emits f then = as separate shorthands" {
+    // pflag's parseSingleShortArg only splits on `=` when len(shorthands)>2.
+    // For `-f=` with f non-value-taking: emit short(f) then short(=).
+    // The flag layer rejects `=` as unknown.
     const gpa = testing.allocator;
     const r = try parseOne(gpa, &.{"-f="}, FlagSchema.empty);
     defer gpa.free(r.tokens);
+    try testing.expectEqual(@as(usize, 2), r.tokens.len);
+    try testing.expectEqual(@as(u8, 'f'), r.tokens[0].short.name);
+    try testing.expect(r.tokens[0].short.value == null);
+    try testing.expectEqual(@as(u8, '='), r.tokens[1].short.name);
+}
+
+test "parseShort: -f= with value-taking f makes \"=\" the value" {
+    // For `-f=` with f value-taking: rest = "=", rest.len > 0 → emit
+    // short(f, value="="). Matches pflag's `value = shorthands[1:]`.
+    const gpa = testing.allocator;
+    const r = try parseOne(gpa, &.{"-f="}, schemaShortValue('f'));
+    defer gpa.free(r.tokens);
     try testing.expectEqual(@as(usize, 1), r.tokens.len);
     try testing.expectEqual(@as(u8, 'f'), r.tokens[0].short.name);
-    try testing.expectEqualStrings("", r.tokens[0].short.value.?);
+    try testing.expectEqualStrings("=", r.tokens[0].short.value.?);
 }
 
 test "parseShort: -= treats = as an unknown shorthand char" {

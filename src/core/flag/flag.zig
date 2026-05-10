@@ -622,6 +622,8 @@ fn bindStringSlice(
     var pieces: std.ArrayListUnmanaged([]const u8) = .empty;
     defer pieces.deinit(allocator);
 
+    // pflag's stringSliceValue replaces on first set, appends on
+    // subsequent. Use flag.changed for the same semantics.
     if (flag.changed) {
         try pieces.appendSlice(allocator, old);
     }
@@ -629,12 +631,13 @@ fn bindStringSlice(
     if (value.len > 0) {
         var it = std.mem.splitScalar(u8, value, ',');
         while (it.next()) |s| try pieces.append(allocator, s);
-    } else if (!flag.changed) {
-        // pflag's readAsCSV("") returns []. Mirror.
     }
 
     const owned = try pieces.toOwnedSlice(allocator);
-    if (flag.changed) allocator.free(old);
+    // The previous storage was either the FlagSet-allocated default
+    // (first set) or the FlagSet-allocated previous result (subsequent).
+    // Both are owned by us via owns_value_storage; free unconditionally.
+    if (flag.owns_value_storage) allocator.free(old);
     ptr.* = owned;
 }
 
@@ -652,10 +655,10 @@ fn bindStringArray(
     if (flag.changed) {
         std.mem.copyForwards([]const u8, owned[0..old.len], old);
         owned[old.len] = value;
-        allocator.free(old);
     } else {
         owned[0] = value;
     }
+    if (flag.owns_value_storage) allocator.free(old);
     ptr.* = owned;
 }
 
@@ -666,13 +669,14 @@ fn bindIntSlice(
     diag: ?*Diagnostic,
 ) (errors.FlagError || std.mem.Allocator.Error)!void {
     // pflag's intSlice uses Atoi (decimal only). We reuse parseSignedInt
-    // with i64 (matching IntVar's width) — which accepts hex/octal too,
-    // a minor divergence; documented in 09 if a fixture surfaces it.
+    // with i64 — which accepts hex/octal/binary too, a documented
+    // divergence (see design-docs/09-zobra-divergences.md § 3.5).
     var pieces: std.ArrayListUnmanaged(i64) = .empty;
     defer pieces.deinit(allocator);
 
     const ptr: *[]const i64 = @ptrCast(@alignCast(flag.value_ptr));
-    if (flag.changed) try pieces.appendSlice(allocator, ptr.*);
+    const old = ptr.*;
+    if (flag.changed) try pieces.appendSlice(allocator, old);
 
     var it = std.mem.splitScalar(u8, value, ',');
     while (it.next()) |s| {
@@ -683,7 +687,7 @@ fn bindIntSlice(
     }
 
     const owned = try pieces.toOwnedSlice(allocator);
-    if (flag.changed) allocator.free(ptr.*);
+    if (flag.owns_value_storage) allocator.free(old);
     ptr.* = owned;
 }
 
@@ -829,12 +833,21 @@ fn failCoerceWithRendered(
         d.code = .type_coercion_failed;
         d.flag_name = flag.name;
         d.raw_value = value;
-        // Render the full pflag wording: invalid argument "X" for "--foo" flag: <cause>
-        const rendered = std.fmt.allocPrint(
-            allocator,
-            "invalid argument \"{s}\" for \"--{s}\" flag: {s}",
-            .{ value, flag.name, cause_msg },
-        ) catch return error.TypeCoercionFailed;
+        // pflag's InvalidValueError wording (errors.go:108-117):
+        //   invalid argument "X" for "--foo" flag: <cause>          (no shorthand)
+        //   invalid argument "X" for "-f, --foo" flag: <cause>      (with shorthand, non-deprecated)
+        const rendered = if (flag.shorthand != 0 and flag.deprecated.len == 0)
+            std.fmt.allocPrint(
+                allocator,
+                "invalid argument \"{s}\" for \"-{c}, --{s}\" flag: {s}",
+                .{ value, flag.shorthand, flag.name, cause_msg },
+            ) catch return error.TypeCoercionFailed
+        else
+            std.fmt.allocPrint(
+                allocator,
+                "invalid argument \"{s}\" for \"--{s}\" flag: {s}",
+                .{ value, flag.name, cause_msg },
+            ) catch return error.TypeCoercionFailed;
         if (d.owns_message) if (d.message) |m| allocator.free(m);
         d.message = rendered;
         d.owns_message = true;
@@ -1094,6 +1107,22 @@ test "FlagSet: stringSlice splits on comma and appends on repeat" {
     try fs.set("tag", "d,e", null);
     try testing.expectEqual(@as(usize, 5), tags.len);
     try testing.expectEqualStrings("e", tags[4]);
+}
+
+test "FlagSet: stringSlice with non-empty default doesn't leak" {
+    // Regression for the "first set replaces a duped default" leak path:
+    // the testing allocator catches a leak if `old` isn't freed when
+    // flag.changed is false on first apply.
+    const gpa = testing.allocator;
+    var fs = FlagSet.init(gpa);
+    defer fs.deinit();
+
+    var tags: []const []const u8 = &.{};
+    try fs.stringSliceVarP(&tags, "tag", 0, &.{ "default-a", "default-b" }, "");
+    try fs.set("tag", "x,y", null);
+    try testing.expectEqual(@as(usize, 2), tags.len);
+    try testing.expectEqualStrings("x", tags[0]);
+    try testing.expectEqualStrings("y", tags[1]);
 }
 
 test "FlagSet: stringArray does not split on comma" {

@@ -183,45 +183,57 @@ pub const Command = struct {
 
     /// Lazy --help / -h registration. Called at the start of execute on
     /// the resolved command, mirroring cobra's InitDefaultHelpFlag.
+    /// Sets `help_flag_initialised` only after every step succeeds, so a
+    /// mid-OOM call leaves the command re-tryable next time.
     fn initDefaultHelpFlag(self: *Command) !void {
         if (self.help_flag_initialised) return;
-        self.help_flag_initialised = true;
-        if (self.flags_set.lookup("help") != null) return;
+        if (self.flags_set.lookup("help") != null) {
+            self.help_flag_initialised = true;
+            return;
+        }
 
         var help_msg_buf: [256]u8 = undefined;
         const msg = try std.fmt.bufPrint(&help_msg_buf, "help for {s}", .{self.commandName()});
 
-        // The usage string is borrow-only on the FlagSet, but bufPrint
-        // returns a slice into the local stack buffer — we need a
-        // longer-lived copy. Allocate via the command's allocator and
-        // remember to free in deinit. Track it on the command via a
-        // lightweight optional slice.
         const owned_msg = try self.allocator.dupe(u8, msg);
         errdefer self.allocator.free(owned_msg);
 
-        // Bind shorthand 'h' only if not already taken.
+        // Append to the owned-strings list FIRST so the list takes the
+        // free responsibility. If boolVarP then fails, the errdefer-pop
+        // detaches the entry and the outer errdefer frees `owned_msg`.
+        try self.help_owned_strings.append(self.allocator, owned_msg);
+        errdefer _ = self.help_owned_strings.pop();
+
         const shorthand: u8 = if (self.flags_set.shorthandLookup('h') == null) 'h' else 0;
         try self.flags_set.boolVarP(&self.help_flag_value, "help", shorthand, false, owned_msg);
-        // Stash the owned string so deinit can free it. Use the
-        // help_owned_strings list defined below.
-        try self.help_owned_strings.append(self.allocator, owned_msg);
+
+        self.help_flag_initialised = true;
     }
 
     /// Lazy --version registration (only when Command.version is non-empty).
     /// cobra binds long-only by default. zobra matches.
     fn initDefaultVersionFlag(self: *Command) !void {
         if (self.version_flag_initialised) return;
-        self.version_flag_initialised = true;
-        if (self.version.len == 0) return;
-        if (self.flags_set.lookup("version") != null) return;
+        if (self.version.len == 0) {
+            self.version_flag_initialised = true;
+            return;
+        }
+        if (self.flags_set.lookup("version") != null) {
+            self.version_flag_initialised = true;
+            return;
+        }
 
         var buf: [256]u8 = undefined;
         const usage = try std.fmt.bufPrint(&buf, "version for {s}", .{self.commandName()});
         const owned_usage = try self.allocator.dupe(u8, usage);
         errdefer self.allocator.free(owned_usage);
 
-        try self.flags_set.boolVarP(&self.version_flag_value, "version", 0, false, owned_usage);
         try self.help_owned_strings.append(self.allocator, owned_usage);
+        errdefer _ = self.help_owned_strings.pop();
+
+        try self.flags_set.boolVarP(&self.version_flag_value, "version", 0, false, owned_usage);
+
+        self.version_flag_initialised = true;
     }
 
     /// Recursively frees this command's children, both flag sets, the
@@ -391,59 +403,95 @@ pub const Command = struct {
     /// `remaining` slice is freshly allocated; caller frees with the same
     /// allocator. (Even if no subcommand resolves, `remaining` is a fresh
     /// slice for a uniform free contract.)
-    pub fn findCommand(self: *Command, allocator: Allocator, argv: []const []const u8) !FoundCommand {
-        return findRec(self, allocator, argv);
+    pub fn findCommand(self: *Command, allocator: Allocator, argv: []const []const u8, diag: ?*Diagnostic) !FoundCommand {
+        return findRec(self, allocator, argv, diag);
     }
 
-    fn findRec(cmd: *Command, allocator: Allocator, argv: []const []const u8) !FoundCommand {
+    fn findRec(cmd: *Command, allocator: Allocator, argv: []const []const u8, diag: ?*Diagnostic) !FoundCommand {
         const schema = cmd.effectiveFlagSchema();
-        const tokens = try parser_mod.parse(allocator, argv, schema, null);
+        const tokens = try parser_mod.parse(allocator, argv, schema, diag);
         defer allocator.free(tokens);
 
         // Find the first POSITIONAL token (not passthrough — passthrough
         // means we already saw `--` and the user explicitly opted out of
-        // subcommand resolution past that point).
-        var first_positional: ?[]const u8 = null;
+        // subcommand resolution past that point). Track the source argv
+        // index too, so we can strip by index (not by string equality —
+        // a flag's value-by-value-take could happen to equal a child name).
+        var first_positional_idx: ?usize = null;
+        var pi: usize = 0;
         for (tokens) |t| switch (t) {
-            .positional => |p| {
-                first_positional = p.value;
+            .positional => {
+                first_positional_idx = pi;
                 break;
             },
             .terminator, .passthrough => break,
-            else => {},
+            else => {
+                // Non-positional consumes either 1 or 2 argv slots
+                // depending on whether the value was attached or taken
+                // from the next argv. Reconstruct the argv index by
+                // tracking how many argv elements each token used.
+                pi += argvUsedByToken(t, argv, pi);
+                continue;
+            },
         };
+        if (first_positional_idx) |idx| pi = idx;
 
-        if (first_positional == null) {
+        if (first_positional_idx == null) {
             const dup = try allocator.dupe([]const u8, argv);
             return .{ .cmd = cmd, .remaining = dup };
         }
 
-        const child = cmd.findChildByNameOrAlias(first_positional.?) orelse {
+        const candidate = argv[pi];
+        const child = cmd.findChildByNameOrAlias(candidate) orelse {
             const dup = try allocator.dupe([]const u8, argv);
             return .{ .cmd = cmd, .remaining = dup };
         };
 
-        // Strip the FIRST occurrence of the candidate from argv. (The
-        // first positional token is always the first argv element that
-        // matches the candidate, since the parser visits argv in order
-        // and emits positionals in source order.)
+        // Strip exactly argv[pi] from argv.
         const stripped = try allocator.alloc([]const u8, argv.len - 1);
         var j: usize = 0;
-        var stripped_one = false;
-        for (argv) |a| {
-            if (!stripped_one and std.mem.eql(u8, a, first_positional.?)) {
-                stripped_one = true;
-                continue;
-            }
+        for (argv, 0..) |a, i| {
+            if (i == pi) continue;
             stripped[j] = a;
             j += 1;
         }
-        const result = findRec(child, allocator, stripped) catch |err| {
+        const result = findRec(child, allocator, stripped, diag) catch |err| {
             allocator.free(stripped);
             return err;
         };
         allocator.free(stripped);
         return result;
+    }
+
+    fn argvUsedByToken(t: Token, argv: []const []const u8, pi: usize) usize {
+        // For long/short tokens with a value: if the value lives in a
+        // SEPARATE argv element (token.value's pointer is different from
+        // any embedded slice of argv[pi]), we consumed 2; otherwise 1.
+        switch (t) {
+            .long => |l| {
+                if (l.value) |v| {
+                    // Compare v's pointer to argv[pi] memory range. If v
+                    // is outside argv[pi], it came from argv[pi+1].
+                    if (pi + 1 < argv.len and slicesAlias(v, argv[pi + 1])) return 2;
+                }
+                return 1;
+            },
+            .short => |s| {
+                if (s.value) |v| {
+                    if (pi + 1 < argv.len and slicesAlias(v, argv[pi + 1])) return 2;
+                }
+                return 1;
+            },
+            .negated, .positional, .terminator, .passthrough => return 1,
+        }
+    }
+
+    fn slicesAlias(a: []const u8, b: []const u8) bool {
+        if (a.len == 0 or b.len == 0) return false;
+        const a_start = @intFromPtr(a.ptr);
+        const b_start = @intFromPtr(b.ptr);
+        const b_end = b_start + b.len;
+        return a_start >= b_start and a_start < b_end;
     }
 
     pub fn findChildByNameOrAlias(self: *const Command, name: []const u8) ?*Command {
@@ -458,6 +506,31 @@ pub const Command = struct {
     pub fn commandName(self: *const Command) []const u8 {
         const idx = std.mem.indexOfScalar(u8, self.use, ' ') orelse return self.use;
         return self.use[0..idx];
+    }
+
+    /// Render the command's full path (root → ... → self) as a
+    /// space-separated string — cobra's Command.CommandPath(). Caller
+    /// frees with the same allocator.
+    pub fn commandPathString(self: *const Command, allocator: Allocator) ![]u8 {
+        var stack: [32]*const Command = undefined;
+        var depth: usize = 0;
+        var p: ?*const Command = self;
+        while (p) |c| : (p = c.parent) {
+            stack[depth] = c;
+            depth += 1;
+            if (depth == stack.len) break;
+        }
+        var aw: std.Io.Writer.Allocating = .init(allocator);
+        defer aw.deinit();
+        var i = depth;
+        var first = true;
+        while (i > 0) {
+            i -= 1;
+            if (!first) try aw.writer.writeByte(' ');
+            try aw.writer.writeAll(stack[i].commandName());
+            first = false;
+        }
+        return aw.toOwnedSlice();
     }
 
     // ---- execute ------------------------------------------------------
@@ -483,7 +556,10 @@ pub const Command = struct {
         const allocator = self.allocator;
         const diag = opts.diag;
 
-        const found = try self.findCommand(allocator, argv);
+        const found = self.findCommand(allocator, argv, diag) catch |err| {
+            if (diag) |d| try renderParseDiag(allocator, d);
+            return err;
+        };
         defer allocator.free(found.remaining);
         const cmd = found.cmd;
         const sub_argv = found.remaining;
@@ -496,13 +572,18 @@ pub const Command = struct {
             for (sub_argv) |s| try cmd.flags_set.args.append(allocator, s);
             const positionals = cmd.flags_set.args.items;
             if (cmd.args) |validator| {
-                try validator.validate(cmd.valid_args, positionals, allocator, diag);
+                const path = try cmd.commandPathString(allocator);
+                defer allocator.free(path);
+                try validator.validate(cmd.valid_args, positionals, path, allocator, diag);
             }
             try hook_mod.run(Command, cmd, positionals, false);
             return;
         }
 
-        const tokens = try parser_mod.parse(allocator, sub_argv, cmd.effectiveFlagSchema(), diag);
+        const tokens = parser_mod.parse(allocator, sub_argv, cmd.effectiveFlagSchema(), diag) catch |err| {
+            if (diag) |d| try renderParseDiag(allocator, d);
+            return err;
+        };
         defer allocator.free(tokens);
 
         cmd.applyTokens(tokens, diag) catch |err| switch (err) {
@@ -517,14 +598,18 @@ pub const Command = struct {
                         d.raw = null;
                     }
                 } else {
-                    // Try to attach a "did you mean" suggestion.
                     if (!cmd.disable_suggestions) {
                         if (diag) |d| if (d.flag_name) |name| {
                             try cmd.attachFlagSuggestion(d, name);
                         };
                     }
+                    if (diag) |d| try renderParseDiag(allocator, d);
                     return err;
                 }
+            },
+            error.MissingValue, error.BadFlagSyntax => {
+                if (diag) |d| try renderParseDiag(allocator, d);
+                return err;
             },
             else => return err,
         };
@@ -550,7 +635,9 @@ pub const Command = struct {
         const positionals = cmd.flags_set.args.items;
 
         if (cmd.args) |validator| {
-            try validator.validate(cmd.valid_args, positionals, allocator, diag);
+            const path = try cmd.commandPathString(allocator);
+            defer allocator.free(path);
+            try validator.validate(cmd.valid_args, positionals, path, allocator, diag);
         }
 
         try cmd.validateRequiredFlags(diag);
@@ -712,6 +799,7 @@ pub const Command = struct {
             if (diag) |d| {
                 d.flag_name = findCharSlice(s.raw, s.name);
                 d.raw = s.raw;
+                d.short_group = shortGroupSuffix(s.raw, s.name);
             }
             return error.UnknownFlag;
         };
@@ -721,6 +809,7 @@ pub const Command = struct {
             if (diag) |d| {
                 d.flag_name = findCharSlice(s.raw, s.name);
                 d.raw = s.raw;
+                d.short_group = shortGroupSuffix(s.raw, s.name);
             }
             return error.MissingValue;
         };
@@ -781,6 +870,56 @@ fn walkFlagsForSuggestion(
             }
         }
     }
+}
+
+/// Render pflag-byte-identical wording for parse-layer errors. The
+/// design (07-error-model.md) puts this in command.zig deliberately —
+/// the parser/flag layers stay layering-clean and write only the
+/// structured fields (flag_name, raw, code) to the diagnostic; this
+/// helper composes the human-readable rendering on the way out.
+///
+/// Wordings (matching pflag):
+///   unknown flag: --foo
+///   unknown shorthand flag: "X" in -group
+///   flag needs an argument: --foo
+///   flag needs an argument: "X" in -group
+///   bad flag syntax: <full argv element>
+fn renderParseDiag(allocator: Allocator, diag: *Diagnostic) !void {
+    if (diag.message != null) return;
+    const code = diag.code orelse return;
+    const rendered: []u8 = switch (code) {
+        .unknown_flag => blk: {
+            if (diag.short_group) |group| {
+                const name = diag.flag_name orelse return;
+                break :blk try std.fmt.allocPrint(
+                    allocator,
+                    "unknown shorthand flag: \"{s}\" in -{s}",
+                    .{ name, group },
+                );
+            }
+            const name = diag.flag_name orelse return;
+            break :blk try std.fmt.allocPrint(allocator, "unknown flag: --{s}", .{name});
+        },
+        .missing_value => blk: {
+            if (diag.short_group) |group| {
+                const name = diag.flag_name orelse return;
+                break :blk try std.fmt.allocPrint(
+                    allocator,
+                    "flag needs an argument: \"{s}\" in -{s}",
+                    .{ name, group },
+                );
+            }
+            const name = diag.flag_name orelse return;
+            break :blk try std.fmt.allocPrint(allocator, "flag needs an argument: --{s}", .{name});
+        },
+        .bad_flag_syntax => blk: {
+            const raw = diag.raw orelse return;
+            break :blk try std.fmt.allocPrint(allocator, "bad flag syntax: {s}", .{raw});
+        },
+        else => return,
+    };
+    diag.message = rendered;
+    diag.owns_message = true;
 }
 
 // ---- private helpers ----------------------------------------------------
@@ -861,6 +1000,17 @@ fn findCharSlice(raw: []const u8, c: u8) []const u8 {
     return raw[idx .. idx + 1];
 }
 
+/// pflag's `specifiedShorthands` field — the remaining shorthands at the
+/// point of error, without the leading `-`. For `-abc` failing on `b`,
+/// the suffix is "bc". The renderer prepends `-` per cobra's wording.
+fn shortGroupSuffix(raw: []const u8, c: u8) []const u8 {
+    if (raw.len < 2) return raw;
+    // raw starts with `-`; search the body.
+    const body = raw[1..];
+    const idx = std.mem.indexOfScalar(u8, body, c) orelse return body;
+    return body[idx..];
+}
+
 /// Coerce `value` and store through `flag.value_ptr`. Mirrors the helper
 /// in flag.zig — duplicated here because Command's apply path uses the
 /// effective lookup (across own + inherited) rather than a single FlagSet.
@@ -903,7 +1053,7 @@ test "Command: findCommand resolves children by name" {
     defer root.deinit();
     try root.addCommand(try Command.init(gpa, .{ .use = "greet [target]" }));
 
-    const found = try root.findCommand(gpa, &.{ "greet", "alice" });
+    const found = try root.findCommand(gpa, &.{ "greet", "alice" }, null);
     defer gpa.free(found.remaining);
     try testing.expectEqualStrings("greet", found.cmd.commandName());
     try testing.expectEqual(@as(usize, 1), found.remaining.len);
@@ -916,7 +1066,7 @@ test "Command: findCommand resolves by alias" {
     defer root.deinit();
     try root.addCommand(try Command.init(gpa, .{ .use = "list", .aliases = &.{ "ls", "l" } }));
 
-    const found = try root.findCommand(gpa, &.{"ls"});
+    const found = try root.findCommand(gpa, &.{"ls"}, null);
     defer gpa.free(found.remaining);
     try testing.expectEqualStrings("list", found.cmd.commandName());
     try testing.expectEqual(@as(usize, 0), found.remaining.len);
@@ -928,7 +1078,7 @@ test "Command: findCommand falls back to self when no child matches" {
     defer root.deinit();
     try root.addCommand(try Command.init(gpa, .{ .use = "greet" }));
 
-    const found = try root.findCommand(gpa, &.{ "stranger", "alice" });
+    const found = try root.findCommand(gpa, &.{ "stranger", "alice" }, null);
     defer gpa.free(found.remaining);
     try testing.expectEqualStrings("root", found.cmd.commandName());
     // remaining still includes both elements because no child matched.
@@ -997,6 +1147,23 @@ test "Command: args validator rejects too few" {
     defer diag.deinit(gpa);
     try testing.expectError(error.ArgsValidationFailed, root.execute(&.{}, &diag));
     try testing.expectEqualStrings("requires at least 1 arg(s), only received 0", diag.message.?);
+}
+
+test "Command: noArgs at depth includes command path in wording" {
+    const gpa = testing.allocator;
+    const root = try Command.init(gpa, .{ .use = "tool" });
+    defer root.deinit();
+    const child = try Command.init(gpa, .{
+        .use = "greet",
+        .args = args_mod.noArgs,
+        .run_e = noopRun,
+    });
+    try root.addCommand(child);
+
+    var diag: Diagnostic = .{};
+    defer diag.deinit(gpa);
+    try testing.expectError(error.ArgsValidationFailed, root.execute(&.{ "greet", "extra" }, &diag));
+    try testing.expectEqualStrings("unknown command \"extra\" for \"tool greet\"", diag.message.?);
 }
 
 test "Command: required flag enforcement" {
@@ -1188,6 +1355,95 @@ test "Command: did-you-mean suggestion on close-by flag" {
     try testing.expectError(error.UnknownFlag, root.execute(&.{ "--nmae", "x" }, &diag));
     try testing.expect(diag.suggestion != null);
     try testing.expectEqualStrings("did you mean --name?", diag.suggestion.?);
+    // pflag-style wording is now rendered automatically.
+    try testing.expectEqualStrings("unknown flag: --nmae", diag.message.?);
+}
+
+test "Command: unknown shorthand renders pflag wording with the group suffix" {
+    const gpa = testing.allocator;
+    const root = try Command.init(gpa, .{ .use = "tool", .run_e = noopRun });
+    defer root.deinit();
+    var a: bool = false;
+    try root.flags().boolVarP(&a, "alpha", 'a', false, "");
+
+    var d: Diagnostic = .{};
+    defer d.deinit(gpa);
+    // -axyz: 'a' binds, then 'x' is unknown. cobra's wording uses the
+    // remaining shorthands ("xyz") with the leading dash.
+    try testing.expectError(error.UnknownFlag, root.execute(&.{"-axyz"}, &d));
+    try testing.expectEqualStrings("unknown shorthand flag: \"x\" in -xyz", d.message.?);
+}
+
+test "Command: hook chain — first persistent ancestor wins (non-traverse)" {
+    // Validator finding #14: regression coverage. With BOTH root and
+    // child setting persistent_pre_run_e, only the child's fires under
+    // the default (non-traverse) mode.
+    const gpa = testing.allocator;
+    const Hooks = struct {
+        var fires: std.ArrayListUnmanaged([]const u8) = .empty;
+        var alloc: std.mem.Allocator = undefined;
+        fn rootHook(_: *Command, _: []const []const u8) anyerror!void {
+            try fires.append(alloc, "root");
+        }
+        fn childHook(_: *Command, _: []const []const u8) anyerror!void {
+            try fires.append(alloc, "child");
+        }
+    };
+    Hooks.fires = .empty;
+    Hooks.alloc = gpa;
+    defer Hooks.fires.deinit(gpa);
+
+    const root = try Command.init(gpa, .{ .use = "root", .persistent_pre_run_e = Hooks.rootHook });
+    defer root.deinit();
+    const child = try Command.init(gpa, .{
+        .use = "child",
+        .persistent_pre_run_e = Hooks.childHook,
+        .run_e = noopRun,
+    });
+    try root.addCommand(child);
+    try root.execute(&.{"child"}, null);
+
+    try testing.expectEqual(@as(usize, 1), Hooks.fires.items.len);
+    try testing.expectEqualStrings("child", Hooks.fires.items[0]);
+}
+
+test "Command: parse error wordings render onto diag.message" {
+    const gpa = testing.allocator;
+
+    {
+        const root = try Command.init(gpa, .{ .use = "tool", .run_e = noopRun });
+        defer root.deinit();
+        var n: i64 = 0;
+        try root.flags().intVarP(&n, "retries", 0, 0, "");
+        var d: Diagnostic = .{};
+        defer d.deinit(gpa);
+        try testing.expectError(error.MissingValue, root.execute(&.{"--retries"}, &d));
+        try testing.expectEqualStrings("flag needs an argument: --retries", d.message.?);
+    }
+
+    {
+        const root = try Command.init(gpa, .{ .use = "tool", .run_e = noopRun });
+        defer root.deinit();
+        var d: Diagnostic = .{};
+        defer d.deinit(gpa);
+        try testing.expectError(error.BadFlagSyntax, root.execute(&.{"---bad"}, &d));
+        try testing.expectEqualStrings("bad flag syntax: ---bad", d.message.?);
+    }
+
+    // Type-coercion error wording now includes the shorthand prefix.
+    {
+        const root = try Command.init(gpa, .{ .use = "tool", .run_e = noopRun });
+        defer root.deinit();
+        var n: i64 = 0;
+        try root.flags().intVarP(&n, "retries", 'r', 0, "");
+        var d: Diagnostic = .{};
+        defer d.deinit(gpa);
+        try testing.expectError(error.TypeCoercionFailed, root.execute(&.{"--retries=foo"}, &d));
+        try testing.expectEqualStrings(
+            "invalid argument \"foo\" for \"-r, --retries\" flag: strconv.ParseInt: parsing \"foo\": invalid syntax",
+            d.message.?,
+        );
+    }
 }
 
 test "Command: suggestionsForCommand returns close subcommands" {

@@ -76,7 +76,7 @@ test "unknown subcommand falls back to root with arbitrary args" {
     defer root.deinit();
     try root.addCommand(try zobra.Command.init(gpa, .{ .use = "known", .run_e = noopRun }));
 
-    const found = try root.findCommand(gpa, &.{ "unknown-sub", "x" });
+    const found = try root.findCommand(gpa, &.{ "unknown-sub", "x" }, null);
     defer gpa.free(found.remaining);
     try testing.expectEqualStrings("tool", found.cmd.commandName());
     try testing.expectEqual(@as(usize, 2), found.remaining.len);

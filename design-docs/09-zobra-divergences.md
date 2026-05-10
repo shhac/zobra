@@ -56,6 +56,7 @@ These are minor incompatibilities with Go's strconv that surface only in unusual
 | Underscore digit separators (`1_000`) | rejected | accepted | Zig's `std.fmt.parseInt` accepts `_`. Won't surface unless a CLI explicitly tests it. |
 | Hex float literals (`0x1.fp10`) | accepted | matches | Zig parseFloat handles. |
 | Leading-zero octal (`0664`) | accepted | accepted | We added an explicit branch in `coerce.zig` because Zig's parseInt requires `0o` prefix; we mirror Go strconv. |
+| `intSlice` element bases | decimal-only (uses `strconv.Atoi`) | accepts hex / octal / binary | pflag uses `strconv.Atoi` for `intSliceValue.Set`, which is decimal-only. zobra's `bindIntSlice` reuses `parseSignedInt(i64, …)` (matching scalar-int parity), which auto-detects the base. The error wording still uses `strconv.Atoi:` to match pflag's wrapped `InvalidValueError`. |
 
 ## 4. The "stricter than cobra" set
 
