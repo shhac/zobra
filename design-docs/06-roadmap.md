@@ -2,6 +2,36 @@
 
 Status of record. Each phase has an explicit acceptance bar; we don't move forward until the previous bar is met.
 
+## Status (as of last update)
+
+Phases 0 through 6 are **landed and pushed**. 135 tests pass under
+`zig build test`; format clean under `zig fmt --check .`. The example
+exe (`zig build run -- --help`, `zig build run -- greet alice -vv`)
+exercises the full pipeline end-to-end.
+
+| Phase | Status | Highlights |
+|---|---|---|
+| 0 — Scaffold | done | Build files, design docs, oracle synced from vipvot |
+| 1 — Parser | done | pflag-faithful tokenizer, schema-aware short-group splitter |
+| 2 — Flag registry | done | 16 scalar `*VarP` types, strconv wording, modifiers |
+| 3 — Command + hooks + args | done | Tree, dispatch, 5-stage hook chain, args validators |
+| 4 — Help renderer | done | cobra-byte-aligned columns, --help / -h auto-injection |
+| 5a — Slice flags | done (subset) | stringSlice/Array/intSlice — pattern established |
+| 5b — Negation + count | verified | Already worked from Phases 1+2; explicit tests |
+| 5c — Flag groups | done | mutex / required-together / one-required, cobra wording |
+| 6 — UX surface | done | Levenshtein suggestions, --version, disable_flag_parsing, allow_unknown_flags |
+| 7 — Comptime path | deferred | Stretch goal; runtime path is the spec |
+| 8 — `zobra-doc` | deferred | Markdown/yaml/man generators |
+| 9 — `zobra-completion` | deferred | bash/zsh/fish/pwsh shell completion |
+
+Pending follow-ups (small, mechanical):
+- The remaining slice/map/network/bytes flag types (most of pflag's
+  alphabet beyond scalars + the three slice variants we shipped).
+- Command groups in help (`addGroup` + `groupId`).
+- CustomFlag vtable (the pflag.Value escape hatch).
+- Differential-test runner (the oracle binary builds; the
+  `oracle-capture.sh` and matrix-runner are still placeholders).
+
 ## Phase 0 — Scaffold (current)
 
 **Goal**: empty project that builds, tests, and formats cleanly.

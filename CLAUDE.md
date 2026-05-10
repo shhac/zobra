@@ -16,16 +16,25 @@ zobra/
 ├── build.zig.zon            # name = .zobra, minimum_zig_version = "0.16.0"
 ├── src/
 │   ├── root.zig             # public API (re-exports + smoke tests)
-│   ├── core/                # implementation, by layer (Phase 1+)
-│   │   ├── parser/          # tokenizer
-│   │   ├── flag/            # flag registry + per-type modules
-│   │   ├── command.zig      # command tree, dispatch, hooks
-│   │   ├── help.zig         # help renderer
-│   │   ├── usage.zig        # usage block (shared by help + error path)
-│   │   ├── args.zig         # args validators
-│   │   ├── hook.zig         # five-stage hook chain
-│   │   ├── suggest.zig      # Levenshtein "did you mean?"
-│   │   ├── diagnostic.zig   # Diagnostic struct
+│   ├── core/                # implementation, by layer
+│   │   ├── parser/
+│   │   │   ├── parser.zig   # driver + FlagSchema view
+│   │   │   ├── token.zig    # Token alphabet
+│   │   │   ├── long.zig     # long-flag handling (mirrors pflag.parseLongArg)
+│   │   │   └── short.zig    # short-flag handling (mirrors pflag.parseSingleShortArg)
+│   │   ├── flag/
+│   │   │   ├── flag.zig     # FlagSet, *VarP, apply, modifiers
+│   │   │   ├── coerce.zig   # strconv-shaped string→typed parsers
+│   │   │   └── duration.zig # Go time.ParseDuration parity
+│   │   ├── command/
+│   │   │   ├── command.zig  # Command tree, execute, flag groups, suggestions
+│   │   │   ├── args.zig     # args validators (minimumN, exactN, …)
+│   │   │   ├── hook.zig     # five-stage hook chain
+│   │   │   └── suggest.zig  # Levenshtein distance
+│   │   ├── help/
+│   │   │   ├── help.zig     # full help composer
+│   │   │   └── usage.zig    # FlagUsages renderer
+│   │   ├── diagnostic.zig   # Diagnostic struct (the out-parameter pattern)
 │   │   └── errors.zig       # error sets
 │   └── examples/
 │       └── hello/main.zig   # the demo executable
