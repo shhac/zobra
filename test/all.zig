@@ -1,8 +1,12 @@
-//! Integration test entry point. As phases land, this file will pull in
+//! Integration test entry point. As phases land, this file pulls in
 //! per-feature test modules under `test/parser/`, `test/flag/`, etc.
 
 const std = @import("std");
 const zobra = @import("zobra");
+
+test {
+    _ = @import("parser/mixed.zig");
+}
 
 test "scaffold: zobra module imports cleanly" {
     try std.testing.expect(zobra.version.len > 0);

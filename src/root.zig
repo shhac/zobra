@@ -1,17 +1,43 @@
 //! zobra — a Zig port of the cobra CLI framework.
 //!
-//! See README.md and design-docs/ for the full picture. This file is the
-//! public API surface; for now it is intentionally thin (Phase 0 scaffold).
-//! Phase 1 lands the parser; subsequent phases grow this module.
+//! See README.md and design-docs/ for the full picture.
+//! Phase 1 ships the parser + supporting types (Diagnostic, error sets,
+//! Token alphabet). Subsequent phases grow the FlagSet, Command runtime,
+//! help renderer, and surrounding infrastructure.
 
 const std = @import("std");
 
 pub const version = "0.0.0";
 
-/// Writes a placeholder banner to the given writer. Exists so the example
-/// executable has something to call before the real surface lands.
+const errors_mod = @import("core/errors.zig");
+pub const ParseError = errors_mod.ParseError;
+pub const FlagError = errors_mod.FlagError;
+pub const CommandError = errors_mod.CommandError;
+pub const ParserError = errors_mod.ParserError;
+
+pub const Diagnostic = @import("core/diagnostic.zig").Diagnostic;
+
+pub const parser = struct {
+    const parser_mod = @import("core/parser/parser.zig");
+    pub const parse = parser_mod.parse;
+    pub const FlagSchema = parser_mod.FlagSchema;
+    pub const Token = @import("core/parser/token.zig").Token;
+};
+
+/// Writes a placeholder banner to the given writer. Goes away once the
+/// example exe has something more meaningful to show (Phase 3).
 pub fn hello(writer: *std.Io.Writer) std.Io.Writer.Error!void {
-    try writer.print("zobra v{s} — scaffold (Phase 0)\n", .{version});
+    try writer.print("zobra v{s} — scaffold (Phase 0–1)\n", .{version});
+}
+
+test {
+    std.testing.refAllDecls(@This());
+    _ = @import("core/diagnostic.zig");
+    _ = @import("core/errors.zig");
+    _ = @import("core/parser/parser.zig");
+    _ = @import("core/parser/token.zig");
+    _ = @import("core/parser/long.zig");
+    _ = @import("core/parser/short.zig");
 }
 
 test "version is non-empty" {

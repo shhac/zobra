@@ -95,8 +95,8 @@ The list below is the test matrix. Each entry has a corresponding case in `test/
 - `--name=foo=bar` — value is `foo=bar` (only the first `=` separates). (differential)
 - `--no-name` — boolean negation; sets false. Only for boolean flags. **Note**: pflag does *not* enable `--no-` automatically — it requires per-flag `NoOptDefVal` opt-in. zobra treats `--no-` as universally available for booleans (matches cobra users' expectations); this is a deliberate divergence documented in [09-zobra-divergences.md](09-zobra-divergences.md).
 - `--no-string-flag` — parser emits a regular `long` token; the flag layer rejects `"no-string-flag"` as unknown (matching pflag's `unknown flag: --no-string-flag`).
-- `---name` — pflag rejects with `bad flag syntax: ---name`. The parser emits a `long` token with `name = "-name"` so the flag layer can detect the leading-dash and produce the matching error. (differential)
-- `--=value` — pflag rejects with `bad flag syntax: --=value`. Parser emits `long` with empty name; flag layer rejects. (differential)
+- `---name` — pflag rejects eagerly with `bad flag syntax: ---name` (its `parseLongArg` checks `name[0] == '-'` before flag lookup). zobra mirrors pflag exactly: the parser raises `error.BadFlagSyntax` with the full source on the Diagnostic, before any token is emitted. The flag layer is not involved. (differential)
+- `--=value` — pflag rejects eagerly with `bad flag syntax: --=value` (same `name[0] == '='` branch). zobra mirrors. (differential)
 
 ### Short flags
 
