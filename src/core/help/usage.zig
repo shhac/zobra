@@ -104,8 +104,14 @@ fn renderLine(allocator: std.mem.Allocator, flag: *const Flag) !RenderedLine {
     }
 
     const unquoted = unquoteUsage(flag);
-    if (unquoted.varname.len > 0) {
-        try pw.print(" {s}", .{unquoted.varname});
+    // For .custom: prefer the user-supplied type_name if no back-quoted
+    // override was found in the usage string.
+    const varname = if (flag.value_type == .custom and unquoted.varname.len == 0)
+        if (flag.custom) |c| c.type_name else ""
+    else
+        unquoted.varname;
+    if (varname.len > 0) {
+        try pw.print(" {s}", .{varname});
     }
 
     // pflag's NoOptDefVal hint — `--flag[=X]` for non-default sentinels.
@@ -205,6 +211,7 @@ pub fn typeDisplayName(t: ValueType) []const u8 {
         .ip_net => "ipNet",
         .bytes_hex => "bytesHex",
         .bytes_base64 => "bytesBase64",
+        .custom => "", // overridden in renderLine via flag.custom.type_name
     };
 }
 
@@ -217,6 +224,7 @@ pub fn defaultIsZeroValue(flag: *const Flag) bool {
         .string => flag.default_value_string.len == 0,
         .string_slice, .string_array, .int_slice, .int32_slice, .int64_slice, .float32_slice, .float64_slice, .bool_slice, .duration_slice, .string_to_string, .string_to_int, .string_to_int64, .bytes_hex, .bytes_base64 => std.mem.eql(u8, flag.default_value_string, "[]"),
         .ip, .ip_mask, .ip_net => flag.default_value_string.len == 0,
+        .custom => flag.default_value_string.len == 0,
     };
 }
 

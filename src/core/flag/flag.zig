@@ -60,6 +60,7 @@ pub const ValueType = enum {
     ip_net, // *[]const u8 — CIDR (e.g. 192.168.1.0/24)
     bytes_hex, // *[]const u8 — decoded bytes (FlagSet-owned)
     bytes_base64, // *[]const u8 — decoded bytes (FlagSet-owned)
+    custom, // CustomFlag vtable — the pflag.Value escape hatch
 
     pub fn isBoolean(self: ValueType) bool {
         return self == .bool;
@@ -81,12 +82,31 @@ pub const ValueType = enum {
     }
 };
 
+/// User-supplied vtable for the `custom` flag type — the pflag.Value
+/// escape hatch. Lets a CLI register a flag whose Set / String / Type
+/// behaviours are user-defined. Mirrors pflag's `Value` interface.
+pub const CustomFlag = struct {
+    /// Opaque pointer to user storage. Passed to set_fn / string_fn.
+    ptr: *anyopaque,
+    /// Type label for help (e.g. "ip-cidr-list", "json-config").
+    type_name: []const u8,
+    /// Coerce a string into the user's storage. Errors propagate.
+    set_fn: *const fn (ptr: *anyopaque, value: []const u8) anyerror!void,
+    /// Render the current value to a string (for help / defaults).
+    /// Caller frees the returned slice with the same allocator.
+    string_fn: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator) anyerror![]const u8,
+};
+
 pub const Flag = struct {
     name: []const u8,
     shorthand: u8, // 0 means no shorthand
     usage: []const u8,
     value_type: ValueType,
+    /// For non-`custom` types: opaque pointer to the user's storage.
+    /// For `custom` type: ignored; see `custom` field below.
     value_ptr: *anyopaque,
+    /// Set when value_type == .custom; the vtable + ptr the user passed.
+    custom: ?CustomFlag = null,
     /// Default rendered as a string for help. Owned by the FlagSet.
     default_value_string: []const u8,
     /// Empty for value-taking flags. "true" for bools, "+1" for counts.
@@ -680,6 +700,43 @@ pub const FlagSet = struct {
         return self.shorthands[c];
     }
 
+    /// pflag's `Flags().Changed(name)`: returns whether the flag was
+    /// actually set on the command line / via Set. Returns false for
+    /// unregistered names (matches pflag).
+    pub fn changed(self: *const FlagSet, name: []const u8) bool {
+        const f = self.lookup(name) orelse return false;
+        return f.changed;
+    }
+
+    /// Register a custom-typed flag (the pflag.Value escape hatch).
+    /// `cf.ptr` is the user's storage — opaque to the FlagSet; only the
+    /// `set_fn` / `string_fn` callbacks know how to read or write it.
+    pub fn varP(
+        self: *FlagSet,
+        cf: CustomFlag,
+        name: []const u8,
+        shorthand: u8,
+        usage: []const u8,
+    ) !void {
+        // Render the initial default by asking the vtable for the
+        // current string representation, then take ownership.
+        const ds = try cf.string_fn(cf.ptr, self.allocator);
+        errdefer self.allocator.free(ds);
+
+        const flag = try self.addFlag(.{
+            .name = name,
+            .shorthand = shorthand,
+            .usage = usage,
+            .value_type = .custom,
+            .value_ptr = cf.ptr,
+            .default_value_string = ds,
+            .owns_default = true,
+            .owns_value_storage = false,
+            .no_opt_def_val = "",
+        });
+        flag.custom = cf;
+    }
+
     // ---- modifiers ------------------------------------------------------
 
     pub fn markRequired(self: *FlagSet, name: []const u8) error{FlagNotFound}!void {
@@ -948,6 +1005,21 @@ fn setStored(
         .ip_net => bindIpNet(allocator, flag, value, diag),
         .bytes_hex => bindBytesHex(allocator, flag, value, diag),
         .bytes_base64 => bindBytesBase64(allocator, flag, value, diag),
+        .custom => bindCustom(allocator, flag, value, diag),
+    };
+}
+
+fn bindCustom(
+    allocator: std.mem.Allocator,
+    flag: *Flag,
+    value: []const u8,
+    diag: ?*Diagnostic,
+) errors.FlagError!void {
+    const cf = flag.custom orelse return error.TypeCoercionFailed;
+    cf.set_fn(cf.ptr, value) catch {
+        const cause = std.fmt.allocPrint(allocator, "invalid value for {s}: {s}", .{ cf.type_name, value }) catch return error.TypeCoercionFailed;
+        defer allocator.free(cause);
+        return failCoerceWithRendered(allocator, flag, value, diag, cause);
     };
 }
 
