@@ -2,11 +2,21 @@
 
 The argv parser is the foundation. Every other layer trusts that the parser handles every weird POSIX/GNU edge case. This document is the catalogue.
 
+## Source of truth: pflag's Go source
+
+When porting parser behaviour, the **canonical reference is [spf13/pflag](https://github.com/spf13/pflag)'s Go source** — specifically `flag.go` (the `parseArgs` / `parseLongArg` / `parseShortArg` / `parseSingleShortArg` family) and `errors.go` (the wording table). cobra wraps pflag for argv parsing; the actual algorithm lives in pflag.
+
+The precedence is:
+
+1. **Behaviour** — the differential fixtures captured from the oracle. The oracle uses real pflag/cobra; if the fixture says X, that's what the parser must produce.
+2. **Algorithm** — pflag's Go source. When implementing, read pflag first; the algorithm is small (≈300 lines for the parse path) and unambiguous.
+3. **Cross-reference** — the [vipvot](https://github.com/shhac/vipvot) TypeScript port is a parallel implementation, useful as a sanity check and for catching corner cases someone else has already noticed. **It is not authoritative.** If vipvot disagrees with pflag, pflag wins; treating vipvot as the source would compound any drift in vipvot back into zobra.
+
 ## Why we write our own
 
 Zig's stdlib has no argv parser equivalent to cobra/pflag. Existing third-party Zig parsers (yazap, zig-clap, zig-flags) are good but each makes design choices that don't compose with the cobra command-tree mental model — they own the dispatch, not just the tokenization. We need a tokenizer we can layer the cobra runtime on top of, so we write our own.
 
-The vipvot port lives in TypeScript and made the same call (see vipvot's `04-parser.md` for the full rationale against `util.parseArgs`). zobra's parser is a direct mechanical translation of vipvot's, with Zig idioms substituted: tagged unions for tokens, error sets + Diagnostic for failures, slices instead of arrays, `[]const u8` instead of `string`.
+The vipvot port made the same call (see vipvot's `04-parser.md` for the rationale against `util.parseArgs`); zobra inherits that decision but ports from pflag directly, not from vipvot.
 
 ## Token alphabet
 
@@ -15,30 +25,25 @@ The parser emits a stream of tokens, not a structured result. Higher layers cons
 ```zig
 pub const Token = union(enum) {
     long: Long,                 // --foo, --foo=bar, --foo bar
-    short: Short,               // -f, -fbar (when -f takes a value)
-    short_group: ShortGroup,    // -abc (boolean group)
-    negated: Negated,           // --no-foo
+    short: Short,               // -f, -fbar, -f bar (one per shorthand char)
+    negated: Negated,           // --no-foo (zobra divergence: universal for booleans)
     positional: Positional,     // anything not starting with -
     terminator,                 // --
     passthrough: []const u8,    // emitted only after a terminator
 
     pub const Long = struct {
         name: []const u8,        // "foo"
-        value: ?[]const u8,      // null if --foo with no value
+        value: ?[]const u8,      // null if --foo had no attached or consumed value
         raw: []const u8,         // "--foo=bar" — for error wording
     };
     pub const Short = struct {
         name: u8,                // 'f'
-        value: ?[]const u8,
-        raw: []const u8,
-    };
-    pub const ShortGroup = struct {
-        names: []const u8,       // "abc" (each char is a flag)
-        raw: []const u8,
+        value: ?[]const u8,      // null for boolean/count-style standalone
+        raw: []const u8,         // the source argv element ("-fbar", "-abc")
     };
     pub const Negated = struct {
         name: []const u8,        // "foo" for --no-foo
-        raw: []const u8,
+        raw: []const u8,         // "--no-foo"
     };
     pub const Positional = struct {
         value: []const u8,
@@ -46,22 +51,35 @@ pub const Token = union(enum) {
 };
 ```
 
-Crucially, the parser is **schema-aware**: it must know which short flags are value-taking to disambiguate `-fbar` (= `-f bar`) from `-fbar` (= `-f -b -a -r`). The parser takes a `FlagSchema` parameter alongside argv.
+There is **no `short_group` kind**. pflag processes each shorthand character independently — `-abc` becomes three logical flag operations, not one group. Our parser mirrors this: `-abc` emits three `short` tokens, each with `raw = "-abc"` so error renderers can still cite the original group.
+
+Crucially, the parser is **schema-aware**: it must know which flags are value-taking to disambiguate `-fbar` (= `-f bar`) from `-fbar` (= `-f -b -a -r`). The parser takes a `FlagSchema` parameter alongside argv.
 
 ```zig
 pub const FlagSchema = struct {
+    /// True if a short flag named `c` exists AND takes a value.
+    /// In pflag terms: the flag exists and `NoOptDefVal == ""`.
+    /// Returns false for unknown shorts (the parser emits a token; the flag
+    /// layer is responsible for rejecting unknown flags).
     is_value_taking_short: *const fn (c: u8) bool,
-    is_count_short: *const fn (c: u8) bool,
+
+    /// Same predicate, long form.
+    is_value_taking_long: *const fn (name: []const u8) bool,
+
+    /// True if a long flag named `name` is registered (any type). Used for
+    /// the literal-no-foo precedence rule: a flag literally registered as
+    /// `no-foo` wins over treating `--no-foo` as the negation of `foo`.
     is_known_long: *const fn (name: []const u8) bool,
-    /// Returns true when `name` (with the `no-` prefix stripped) refers to a
-    /// boolean long flag. zobra makes every boolean negatable (deliberate
-    /// divergence from pflag — see 09-zobra-divergences.md), so this drives
-    /// `--no-foo` recognition directly.
+
+    /// True if a long flag named `name` is registered as a boolean. Drives
+    /// `--no-foo` recognition (zobra divergence — see 09-zobra-divergences.md).
     is_boolean_long: *const fn (name: []const u8) bool,
 };
 ```
 
 The function-pointer shape lets the command runtime build a schema view that already accounts for inherited persistent flags, without the parser knowing anything about command trees.
+
+**Counts are not a parser concern.** A `count` flag (`-vvv` → 3) has no value-taking shape from the parser's POV; `is_value_taking_short('v')` returns false, and the parser emits one `short{name='v'}` token per `v`. The flag layer counts the occurrences. This matches pflag, which uses `NoOptDefVal = "+1"` for counts and processes them through the same standalone-shorthand path as booleans.
 
 ## Edge-case catalogue
 

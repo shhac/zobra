@@ -10,6 +10,16 @@ We compile a small Go program built on **real cobra**. We feed it a comprehensiv
 
 The Go cobra binary is the **oracle**: an authority for what "correct" means. It cannot be wrong about cobra's behaviour because it *is* cobra.
 
+## Source-of-truth precedence (when implementing)
+
+When porting a behaviour to zobra, the precedence — strongest to weakest — is:
+
+1. **The differential fixtures** (`test/fixtures/oracle.json`). They are the captured behaviour of the oracle binary. If the fixture says X, zobra must produce X. No fixture-vs-implementation tie-breaking is needed because the fixture was produced by a real cobra binary.
+2. **The Go source** of `spf13/pflag` and `spf13/cobra`. When the fixture is silent on an edge case, read the Go source — it is the canonical implementation. The algorithm in pflag's `flag.go` (≈300 lines for the parse path) is small and unambiguous.
+3. **The [vipvot](https://github.com/shhac/vipvot) TypeScript port**. Useful as a parallel-port reference and sanity check — vipvot has already had to make many of the same Zig-specific decisions (modulo language). **Not authoritative.** If vipvot disagrees with pflag, pflag wins. Treating vipvot as the source would let any vipvot bug propagate into zobra unchecked.
+
+The single point of authority is "the oracle is what real cobra does." Everything else is implementation reference.
+
 ## Sister project: shared oracle with vipvot
 
 [vipvot](https://github.com/shhac/vipvot) is the TypeScript port of cobra by the same author. zobra and vipvot **share the oracle**: same `oracle/main.go`, same JSON fixtures. One source of truth governs both ports.
