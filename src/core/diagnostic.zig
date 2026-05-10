@@ -70,6 +70,25 @@ pub const Diagnostic = struct {
         if (self.owns_suggestion) if (self.suggestion) |s| allocator.free(s);
         self.* = .{};
     }
+
+    /// Set `message` to a freshly-allocated slice the Diagnostic now owns.
+    /// Frees any previous owned message in the slot. Used everywhere we
+    /// render a human-readable wording for a failure (parser, flag,
+    /// args, group). Replaces the 5-site free-old-then-assign-then-mark
+    /// pattern; misuse risks a silent leak.
+    pub fn setOwnedMessage(self: *Diagnostic, allocator: std.mem.Allocator, msg: []u8) void {
+        if (self.owns_message) if (self.message) |m| allocator.free(m);
+        self.message = msg;
+        self.owns_message = true;
+    }
+
+    /// Same shape for the `suggestion` slot (see attachFlagSuggestion in
+    /// command.zig).
+    pub fn setOwnedSuggestion(self: *Diagnostic, allocator: std.mem.Allocator, msg: []u8) void {
+        if (self.owns_suggestion) if (self.suggestion) |s| allocator.free(s);
+        self.suggestion = msg;
+        self.owns_suggestion = true;
+    }
 };
 
 /// Conditional helper: assign a tagged category+code on a `?*Diagnostic`,
@@ -107,4 +126,31 @@ test "Diagnostic: deinit frees an owned message" {
     d.message = try gpa.dupe(u8, "error: unknown flag --foo");
     d.owns_message = true;
     d.deinit(gpa);
+}
+
+test "Diagnostic: setOwnedMessage frees the previous owned slot" {
+    const gpa = std.testing.allocator;
+    var d: Diagnostic = .{};
+    defer d.deinit(gpa);
+
+    const first = try gpa.dupe(u8, "first message");
+    d.setOwnedMessage(gpa, first);
+    try std.testing.expectEqualStrings("first message", d.message.?);
+    try std.testing.expect(d.owns_message);
+
+    // Setter should free `first` before assigning `second`. Tested by
+    // running under std.testing.allocator — a leak of `first` would fail.
+    const second = try gpa.dupe(u8, "second message");
+    d.setOwnedMessage(gpa, second);
+    try std.testing.expectEqualStrings("second message", d.message.?);
+}
+
+test "Diagnostic: setOwnedSuggestion replaces and frees" {
+    const gpa = std.testing.allocator;
+    var d: Diagnostic = .{};
+    defer d.deinit(gpa);
+
+    d.setOwnedSuggestion(gpa, try gpa.dupe(u8, "did you mean --name?"));
+    d.setOwnedSuggestion(gpa, try gpa.dupe(u8, "did you mean --version?"));
+    try std.testing.expectEqualStrings("did you mean --version?", d.suggestion.?);
 }

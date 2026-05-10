@@ -97,9 +97,7 @@ fn failWith(
         d.category = .command;
         d.code = .args_validation_failed;
         const msg = std.fmt.allocPrint(allocator, fmt, args) catch return error.ArgsValidationFailed;
-        if (d.owns_message) if (d.message) |m| allocator.free(m);
-        d.message = msg;
-        d.owns_message = true;
+        d.setOwnedMessage(allocator, msg);
     }
     return error.ArgsValidationFailed;
 }
@@ -120,9 +118,7 @@ fn failWithCmd(
             std.fmt.allocPrint(allocator, "{s} for \"{s}\"", .{ base, command_path }) catch return error.ArgsValidationFailed
         else
             allocator.dupe(u8, base) catch return error.ArgsValidationFailed;
-        if (d.owns_message) if (d.message) |m| allocator.free(m);
-        d.message = msg;
-        d.owns_message = true;
+        d.setOwnedMessage(allocator, msg);
     }
     return error.ArgsValidationFailed;
 }

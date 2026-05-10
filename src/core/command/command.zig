@@ -408,38 +408,13 @@ pub const Command = struct {
     }
 
     fn findRec(cmd: *Command, allocator: Allocator, argv: []const []const u8, diag: ?*Diagnostic) !FoundCommand {
-        const schema = cmd.effectiveFlagSchema();
-        const tokens = try parser_mod.parse(allocator, argv, schema, diag);
+        const tokens = try parser_mod.parse(allocator, argv, cmd.effectiveFlagSchema(), diag);
         defer allocator.free(tokens);
 
-        // Find the first POSITIONAL token (not passthrough — passthrough
-        // means we already saw `--` and the user explicitly opted out of
-        // subcommand resolution past that point). Track the source argv
-        // index too, so we can strip by index (not by string equality —
-        // a flag's value-by-value-take could happen to equal a child name).
-        var first_positional_idx: ?usize = null;
-        var pi: usize = 0;
-        for (tokens) |t| switch (t) {
-            .positional => {
-                first_positional_idx = pi;
-                break;
-            },
-            .terminator, .passthrough => break,
-            else => {
-                // Non-positional consumes either 1 or 2 argv slots
-                // depending on whether the value was attached or taken
-                // from the next argv. Reconstruct the argv index by
-                // tracking how many argv elements each token used.
-                pi += argvUsedByToken(t, argv, pi);
-                continue;
-            },
-        };
-        if (first_positional_idx) |idx| pi = idx;
-
-        if (first_positional_idx == null) {
+        const pi = firstPositionalArgvIndex(tokens, argv) orelse {
             const dup = try allocator.dupe([]const u8, argv);
             return .{ .cmd = cmd, .remaining = dup };
-        }
+        };
 
         const candidate = argv[pi];
         const child = cmd.findChildByNameOrAlias(candidate) orelse {
@@ -447,51 +422,9 @@ pub const Command = struct {
             return .{ .cmd = cmd, .remaining = dup };
         };
 
-        // Strip exactly argv[pi] from argv.
-        const stripped = try allocator.alloc([]const u8, argv.len - 1);
-        var j: usize = 0;
-        for (argv, 0..) |a, i| {
-            if (i == pi) continue;
-            stripped[j] = a;
-            j += 1;
-        }
-        const result = findRec(child, allocator, stripped, diag) catch |err| {
-            allocator.free(stripped);
-            return err;
-        };
-        allocator.free(stripped);
-        return result;
-    }
-
-    fn argvUsedByToken(t: Token, argv: []const []const u8, pi: usize) usize {
-        // For long/short tokens with a value: if the value lives in a
-        // SEPARATE argv element (token.value's pointer is different from
-        // any embedded slice of argv[pi]), we consumed 2; otherwise 1.
-        switch (t) {
-            .long => |l| {
-                if (l.value) |v| {
-                    // Compare v's pointer to argv[pi] memory range. If v
-                    // is outside argv[pi], it came from argv[pi+1].
-                    if (pi + 1 < argv.len and slicesAlias(v, argv[pi + 1])) return 2;
-                }
-                return 1;
-            },
-            .short => |s| {
-                if (s.value) |v| {
-                    if (pi + 1 < argv.len and slicesAlias(v, argv[pi + 1])) return 2;
-                }
-                return 1;
-            },
-            .negated, .positional, .terminator, .passthrough => return 1,
-        }
-    }
-
-    fn slicesAlias(a: []const u8, b: []const u8) bool {
-        if (a.len == 0 or b.len == 0) return false;
-        const a_start = @intFromPtr(a.ptr);
-        const b_start = @intFromPtr(b.ptr);
-        const b_end = b_start + b.len;
-        return a_start >= b_start and a_start < b_end;
+        const stripped = try argvWithout(allocator, argv, pi);
+        defer allocator.free(stripped);
+        return findRec(child, allocator, stripped, diag);
     }
 
     pub fn findChildByNameOrAlias(self: *const Command, name: []const u8) ?*Command {
@@ -567,40 +500,49 @@ pub const Command = struct {
         try cmd.initDefaultHelpFlag();
         try cmd.initDefaultVersionFlag();
 
-        if (cmd.disable_flag_parsing) {
-            // Pass the entire sub_argv as positionals; skip flag parsing.
-            for (sub_argv) |s| try cmd.flags_set.args.append(allocator, s);
-            const positionals = cmd.flags_set.args.items;
-            if (cmd.args) |validator| {
-                const path = try cmd.commandPathString(allocator);
-                defer allocator.free(path);
-                try validator.validate(cmd.valid_args, positionals, path, allocator, diag);
-            }
-            try hook_mod.run(Command, cmd, positionals, false);
-            return;
-        }
+        if (cmd.disable_flag_parsing) return cmd.runDisabledFlagParsing(sub_argv, opts);
 
-        const tokens = parser_mod.parse(allocator, sub_argv, cmd.effectiveFlagSchema(), diag) catch |err| {
+        try cmd.parseAndApply(sub_argv, diag);
+
+        if (try cmd.dispatchTerminalFlags(opts)) return;
+        try cmd.runValidatedHookChain(diag);
+    }
+
+    /// `disable_flag_parsing` short-circuit: pass argv to args validators
+    /// + Run hooks verbatim (no flag parsing). Mirrors cobra's
+    /// DisableFlagParsing branch in command.go:964.
+    fn runDisabledFlagParsing(self: *Command, sub_argv: []const []const u8, opts: ExecuteOptions) !void {
+        const allocator = self.allocator;
+        for (sub_argv) |s| try self.flags_set.args.append(allocator, s);
+        const positionals = self.flags_set.args.items;
+        if (self.args) |validator| {
+            const path = try self.commandPathString(allocator);
+            defer allocator.free(path);
+            try validator.validate(self.valid_args, positionals, path, allocator, opts.diag);
+        }
+        try hook_mod.run(Command, self, positionals, false);
+    }
+
+    /// Parse argv into tokens and apply them to the effective flag set.
+    /// Renders pflag-byte-identical wording onto `diag` for any failure
+    /// in the parse or apply layer. `allow_unknown_flags` swallows
+    /// UnknownFlag errors; everything else propagates after rendering.
+    fn parseAndApply(self: *Command, sub_argv: []const []const u8, diag: ?*Diagnostic) !void {
+        const allocator = self.allocator;
+        const tokens = parser_mod.parse(allocator, sub_argv, self.effectiveFlagSchema(), diag) catch |err| {
             if (diag) |d| try renderParseDiag(allocator, d);
             return err;
         };
         defer allocator.free(tokens);
 
-        cmd.applyTokens(tokens, diag) catch |err| switch (err) {
+        self.applyTokens(tokens, diag) catch |err| switch (err) {
             error.UnknownFlag => {
-                if (cmd.allow_unknown_flags) {
-                    // Silently swallow; reset diagnostic so later checks
-                    // don't see it.
-                    if (diag) |d| {
-                        d.category = null;
-                        d.code = null;
-                        d.flag_name = null;
-                        d.raw = null;
-                    }
+                if (self.allow_unknown_flags) {
+                    swallowParseDiag(diag);
                 } else {
-                    if (!cmd.disable_suggestions) {
+                    if (!self.disable_suggestions) {
                         if (diag) |d| if (d.flag_name) |name| {
-                            try cmd.attachFlagSuggestion(d, name);
+                            try self.attachFlagSuggestion(d, name);
                         };
                     }
                     if (diag) |d| try renderParseDiag(allocator, d);
@@ -613,37 +555,41 @@ pub const Command = struct {
             },
             else => return err,
         };
+    }
 
-        // --version dispatch.
-        if (cmd.version_flag_value and cmd.version.len > 0) {
+    /// `--version` and `--help` dispatch. Returns true when one fired
+    /// (caller should stop); returns false otherwise.
+    fn dispatchTerminalFlags(self: *Command, opts: ExecuteOptions) !bool {
+        if (self.version_flag_value and self.version.len > 0) {
             if (opts.out_writer) |w| {
-                try w.print("{s} version {s}\n", .{ cmd.commandName(), cmd.version });
-                return;
+                try w.print("{s} version {s}\n", .{ self.commandName(), self.version });
+                return true;
             }
             return error.VersionRequested;
         }
-
-        // Help dispatch: --help requested or no Run defined.
-        if (cmd.help_flag_value or (cmd.run_e == null and cmd.run == null)) {
+        if (self.help_flag_value or (self.run_e == null and self.run == null)) {
             if (opts.out_writer) |w| {
-                try cmd.printHelp(allocator, w);
-                return;
+                try self.printHelp(self.allocator, w);
+                return true;
             }
             return error.HelpRequested;
         }
+        return false;
+    }
 
-        const positionals = cmd.flags_set.args.items;
-
-        if (cmd.args) |validator| {
-            const path = try cmd.commandPathString(allocator);
+    /// Tail of the happy-path: validate args, validate required flags,
+    /// validate flag groups, run the hook chain.
+    fn runValidatedHookChain(self: *Command, diag: ?*Diagnostic) !void {
+        const allocator = self.allocator;
+        const positionals = self.flags_set.args.items;
+        if (self.args) |validator| {
+            const path = try self.commandPathString(allocator);
             defer allocator.free(path);
-            try validator.validate(cmd.valid_args, positionals, path, allocator, diag);
+            try validator.validate(self.valid_args, positionals, path, allocator, diag);
         }
-
-        try cmd.validateRequiredFlags(diag);
-        try cmd.validateFlagGroups(diag);
-
-        try hook_mod.run(Command, cmd, positionals, false);
+        try self.validateRequiredFlags(diag);
+        try self.validateFlagGroups(diag);
+        try hook_mod.run(Command, self, positionals, false);
     }
 
     /// Compute "did you mean?" suggestions for an unknown subcommand name.
@@ -680,9 +626,7 @@ pub const Command = struct {
         try walkFlagsForSuggestion(self, allocator, typed, &best, &best_d);
         if (best) |b| {
             const owned = try std.fmt.allocPrint(allocator, "did you mean --{s}?", .{b});
-            if (diag.owns_suggestion) if (diag.suggestion) |s| allocator.free(s);
-            diag.suggestion = owned;
-            diag.owns_suggestion = true;
+            diag.setOwnedSuggestion(allocator, owned);
         }
     }
 
@@ -761,67 +705,29 @@ pub const Command = struct {
         tokens: []const Token,
         diag: ?*Diagnostic,
     ) (errors.ParseError || errors.FlagError || std.mem.Allocator.Error)!void {
-        for (tokens) |tok| switch (tok) {
-            .long => |l| try self.applyLong(l, diag),
-            .short => |s| try self.applyShort(s, diag),
-            .negated => |n| try self.applyNegated(n, diag),
-            .positional => |p| try self.flags_set.args.append(self.allocator, p.value),
-            .terminator => self.flags_set.args_len_at_dash = self.flags_set.args.items.len,
-            .passthrough => |v| try self.flags_set.args.append(self.allocator, v),
-        };
+        return flag_mod.applyTokensWith(
+            &self.flags_set,
+            self,
+            EffectiveApplyCallbacks.lookupLong,
+            EffectiveApplyCallbacks.lookupShort,
+            tokens,
+            diag,
+        );
     }
 
-    fn applyLong(self: *Command, l: Token.Long, diag: ?*Diagnostic) (errors.ParseError || errors.FlagError || std.mem.Allocator.Error)!void {
-        const flag = self.lookupLong(l.name) orelse {
-            fillDiag(diag, .parse, .unknown_flag);
-            if (diag) |d| {
-                d.flag_name = l.name;
-                d.raw = l.raw;
-            }
-            return error.UnknownFlag;
-        };
-        const v = l.value orelse blk: {
-            if (flag.no_opt_def_val.len > 0) break :blk flag.no_opt_def_val;
-            fillDiag(diag, .parse, .missing_value);
-            if (diag) |d| {
-                d.flag_name = l.name;
-                d.raw = l.raw;
-            }
-            return error.MissingValue;
-        };
-        try setStored(self.allocator, flag, v, diag);
-        flag.changed = true;
-    }
-
-    fn applyShort(self: *Command, s: Token.Short, diag: ?*Diagnostic) (errors.ParseError || errors.FlagError || std.mem.Allocator.Error)!void {
-        const flag = self.lookupShort(s.name) orelse {
-            fillDiag(diag, .parse, .unknown_flag);
-            if (diag) |d| {
-                d.flag_name = findCharSlice(s.raw, s.name);
-                d.raw = s.raw;
-                d.short_group = shortGroupSuffix(s.raw, s.name);
-            }
-            return error.UnknownFlag;
-        };
-        const v = s.value orelse blk: {
-            if (flag.no_opt_def_val.len > 0) break :blk flag.no_opt_def_val;
-            fillDiag(diag, .parse, .missing_value);
-            if (diag) |d| {
-                d.flag_name = findCharSlice(s.raw, s.name);
-                d.raw = s.raw;
-                d.short_group = shortGroupSuffix(s.raw, s.name);
-            }
-            return error.MissingValue;
-        };
-        try setStored(self.allocator, flag, v, diag);
-        flag.changed = true;
-    }
-
-    fn applyNegated(self: *Command, n: Token.Negated, _: ?*Diagnostic) (errors.ParseError || errors.FlagError || std.mem.Allocator.Error)!void {
-        const flag = self.lookupLong(n.name) orelse return error.UnknownFlag;
-        try setStored(self.allocator, flag, "false", null);
-        flag.changed = true;
-    }
+    /// Lookup callbacks used by the shared apply loop. The Command path
+    /// walks own flags + inherited persistent flags via lookupLong /
+    /// lookupShort.
+    const EffectiveApplyCallbacks = struct {
+        fn lookupLong(ctx: *const anyopaque, name: []const u8) ?*flag_mod.Flag {
+            const cmd: *const Command = @ptrCast(@alignCast(ctx));
+            return cmd.lookupLong(name);
+        }
+        fn lookupShort(ctx: *const anyopaque, c: u8) ?*flag_mod.Flag {
+            const cmd: *const Command = @ptrCast(@alignCast(ctx));
+            return cmd.lookupShort(c);
+        }
+    };
 
     fn validateRequiredFlags(self: *const Command, diag: ?*Diagnostic) errors.FlagError!void {
         // Own flags first.
@@ -869,6 +775,92 @@ fn walkFlagsForSuggestion(
                 best.* = flag.name;
             }
         }
+    }
+}
+
+/// Return the argv index of the first positional token in `tokens`.
+/// Returns null when the token stream has no positional before the
+/// first terminator/passthrough (which happens when argv is all flags
+/// or the user invoked `--` early). Pure function — testable in
+/// isolation against a hand-built token stream.
+///
+/// Note: this is *not* the same as the position of the first positional
+/// token in the token slice. Long/short tokens with a separate-argv
+/// value consume two argv slots, so the mapping from token-index to
+/// argv-index isn't 1:1. The byte-pointer aliasing in `argvUsedByToken`
+/// reconstructs it.
+pub fn firstPositionalArgvIndex(tokens: []const Token, argv: []const []const u8) ?usize {
+    var pi: usize = 0;
+    for (tokens) |t| switch (t) {
+        .positional => return pi,
+        .terminator, .passthrough => return null,
+        .long, .short, .negated => {
+            pi += argvUsedByToken(t, argv, pi);
+            if (pi > argv.len) return null;
+        },
+    };
+    return null;
+}
+
+/// argv slots consumed by a single token at `pi`. Long/short with a
+/// SEPARATE-argv value consume 2 (e.g. `--name alice` is two argv
+/// slots); attached values (`--name=alice`, `-nalice`) and value-less
+/// boolean/count tokens consume 1.
+fn argvUsedByToken(t: Token, argv: []const []const u8, pi: usize) usize {
+    switch (t) {
+        .long => |l| {
+            if (l.value) |v| {
+                if (pi + 1 < argv.len and slicesAlias(v, argv[pi + 1])) return 2;
+            }
+            return 1;
+        },
+        .short => |s| {
+            if (s.value) |v| {
+                if (pi + 1 < argv.len and slicesAlias(v, argv[pi + 1])) return 2;
+            }
+            return 1;
+        },
+        .negated, .positional, .terminator, .passthrough => return 1,
+    }
+}
+
+/// True iff slice `a` is a sub-range of slice `b` by byte address.
+/// Used to detect "did this token's value come from the next argv
+/// element?" — if v aliases argv[pi+1], the parser consumed it.
+fn slicesAlias(a: []const u8, b: []const u8) bool {
+    if (a.len == 0 or b.len == 0) return false;
+    const a_start = @intFromPtr(a.ptr);
+    const b_start = @intFromPtr(b.ptr);
+    const b_end = b_start + b.len;
+    return a_start >= b_start and a_start < b_end;
+}
+
+/// Allocate a fresh argv slice equal to `argv` minus the element at
+/// `idx`. Caller frees with the same allocator.
+fn argvWithout(allocator: Allocator, argv: []const []const u8, idx: usize) ![]const []const u8 {
+    std.debug.assert(idx < argv.len);
+    const out = try allocator.alloc([]const u8, argv.len - 1);
+    var j: usize = 0;
+    for (argv, 0..) |a, i| {
+        if (i == idx) continue;
+        out[j] = a;
+        j += 1;
+    }
+    return out;
+}
+
+/// Reset the parse-layer fields on a Diagnostic. Used by
+/// `allow_unknown_flags`: the apply layer filled the diagnostic before
+/// raising UnknownFlag; the swallow path needs to clear it so a
+/// downstream check (validateRequiredFlags, etc.) doesn't see stale
+/// state.
+fn swallowParseDiag(diag: ?*Diagnostic) void {
+    if (diag) |d| {
+        d.category = null;
+        d.code = null;
+        d.flag_name = null;
+        d.raw = null;
+        d.short_group = null;
     }
 }
 
@@ -943,9 +935,7 @@ fn failGroup(
     if (diag) |d| {
         d.category = .flag;
         d.code = .flag_group_violation;
-        if (d.owns_message) if (d.message) |m| allocator.free(m);
-        d.message = rendered;
-        d.owns_message = true;
+        d.setOwnedMessage(allocator, rendered);
     } else {
         allocator.free(rendered);
     }
@@ -993,34 +983,6 @@ fn renderTemplate(allocator: Allocator, template: []const u8, group: []const u8,
         }
     }
     return aw.toOwnedSlice();
-}
-
-fn findCharSlice(raw: []const u8, c: u8) []const u8 {
-    const idx = std.mem.indexOfScalar(u8, raw, c) orelse return raw[0..0];
-    return raw[idx .. idx + 1];
-}
-
-/// pflag's `specifiedShorthands` field — the remaining shorthands at the
-/// point of error, without the leading `-`. For `-abc` failing on `b`,
-/// the suffix is "bc". The renderer prepends `-` per cobra's wording.
-fn shortGroupSuffix(raw: []const u8, c: u8) []const u8 {
-    if (raw.len < 2) return raw;
-    // raw starts with `-`; search the body.
-    const body = raw[1..];
-    const idx = std.mem.indexOfScalar(u8, body, c) orelse return body;
-    return body[idx..];
-}
-
-/// Coerce `value` and store through `flag.value_ptr`. Mirrors the helper
-/// in flag.zig — duplicated here because Command's apply path uses the
-/// effective lookup (across own + inherited) rather than a single FlagSet.
-fn setStored(
-    allocator: Allocator,
-    flag: *flag_mod.Flag,
-    value: []const u8,
-    diag: ?*Diagnostic,
-) (errors.FlagError || std.mem.Allocator.Error)!void {
-    return flag_mod.setStoredExternal(allocator, flag, value, diag);
 }
 
 // ---- tests --------------------------------------------------------------
@@ -1341,6 +1303,56 @@ test "Command: allow_unknown_flags swallows unknowns" {
     try root.flags().intVarP(&n, "count", 0, 0, "");
     try root.execute(&.{ "--count=5", "--mystery=zzz" }, null);
     try testing.expectEqual(@as(i64, 5), n);
+}
+
+test "firstPositionalArgvIndex: empty argv returns null" {
+    const tokens: []const Token = &.{};
+    try testing.expect(firstPositionalArgvIndex(tokens, &.{}) == null);
+}
+
+test "firstPositionalArgvIndex: leading positional" {
+    const tokens: []const Token = &.{.{ .positional = .{ .value = "x" } }};
+    try testing.expectEqual(@as(?usize, 0), firstPositionalArgvIndex(tokens, &.{"x"}));
+}
+
+test "firstPositionalArgvIndex: long with attached value, then positional" {
+    // argv: ["--name=alice", "greet"] → tokens: long(name="alice"), positional("greet")
+    // attached value, so long consumes 1 argv slot. positional is at idx 1.
+    const argv: []const []const u8 = &.{ "--name=alice", "greet" };
+    const tokens: []const Token = &.{
+        .{ .long = .{ .name = "name", .value = argv[0][7..], .raw = argv[0] } },
+        .{ .positional = .{ .value = argv[1] } },
+    };
+    try testing.expectEqual(@as(?usize, 1), firstPositionalArgvIndex(tokens, argv));
+}
+
+test "firstPositionalArgvIndex: long with separate-argv value consumes 2 slots" {
+    // argv: ["--name", "alice", "greet"] → tokens: long(value=argv[1]), positional(argv[2])
+    const argv: []const []const u8 = &.{ "--name", "alice", "greet" };
+    const tokens: []const Token = &.{
+        .{ .long = .{ .name = "name", .value = argv[1], .raw = argv[0] } },
+        .{ .positional = .{ .value = argv[2] } },
+    };
+    try testing.expectEqual(@as(?usize, 2), firstPositionalArgvIndex(tokens, argv));
+}
+
+test "firstPositionalArgvIndex: terminator stops the search" {
+    const argv: []const []const u8 = &.{ "--", "x" };
+    const tokens: []const Token = &.{
+        .terminator,
+        .{ .passthrough = "x" },
+    };
+    try testing.expect(firstPositionalArgvIndex(tokens, argv) == null);
+}
+
+test "argvWithout: drops the indexed element" {
+    const gpa = testing.allocator;
+    const argv: []const []const u8 = &.{ "a", "b", "c" };
+    const out = try argvWithout(gpa, argv, 1);
+    defer gpa.free(out);
+    try testing.expectEqual(@as(usize, 2), out.len);
+    try testing.expectEqualStrings("a", out[0]);
+    try testing.expectEqualStrings("c", out[1]);
 }
 
 test "Command: did-you-mean suggestion on close-by flag" {

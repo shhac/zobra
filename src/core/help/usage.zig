@@ -22,6 +22,20 @@ pub fn flagUsages(allocator: std.mem.Allocator, set: *const FlagSet) ![]u8 {
     return flagUsagesMerged(allocator, &.{set});
 }
 
+/// One rendered flag line, split at the alignment column. `prefix` is
+/// `"  -n, --name string"`-shape; `tail` is the description plus any
+/// `(default …)` / `(DEPRECATED: …)` suffix. Both slices are owned by
+/// the caller.
+const RenderedLine = struct {
+    prefix: []u8,
+    tail: []u8,
+
+    fn deinit(self: RenderedLine, allocator: std.mem.Allocator) void {
+        allocator.free(self.prefix);
+        allocator.free(self.tail);
+    }
+};
+
 /// Render multiple FlagSets as one merged, name-sorted usage block.
 /// cobra's default rendering merges `Flags()` + `PersistentFlags()` for
 /// the current command's "Flags:" section, and merges every ancestor's
@@ -39,17 +53,16 @@ pub fn flagUsagesMerged(allocator: std.mem.Allocator, sets: []const *const FlagS
 
     std.mem.sort(*const Flag, flags.items, {}, lessByName);
 
-    var lines: std.ArrayListUnmanaged([]u8) = .empty;
+    var lines: std.ArrayListUnmanaged(RenderedLine) = .empty;
     defer {
-        for (lines.items) |l| allocator.free(l);
+        for (lines.items) |l| l.deinit(allocator);
         lines.deinit(allocator);
     }
 
     var maxlen: usize = 0;
     for (flags.items) |flag| {
         const line = try renderLine(allocator, flag);
-        const sentinel = std.mem.indexOfScalar(u8, line, 0) orelse line.len;
-        if (sentinel > maxlen) maxlen = sentinel;
+        if (line.prefix.len > maxlen) maxlen = line.prefix.len;
         try lines.append(allocator, line);
     }
 
@@ -58,18 +71,14 @@ pub fn flagUsagesMerged(allocator: std.mem.Allocator, sets: []const *const FlagS
     const w = &aw.writer;
 
     for (lines.items) |line| {
-        const sidx = std.mem.indexOfScalar(u8, line, 0) orelse line.len;
-        const prefix = line[0..sidx];
-        const tail = if (sidx + 1 < line.len) line[sidx + 1 ..] else line[line.len..line.len];
-
-        try w.writeAll(prefix);
+        try w.writeAll(line.prefix);
         // pflag's Fprintln pattern: prefix + " " + spacing + " " + tail.
-        // For the longest line (sidx == maxlen) that's exactly 2 spaces;
-        // shorter lines get (maxlen - sidx) extra spaces so descriptions
-        // line up.
-        const pad_count = maxlen - sidx + 2;
+        // For the longest line (prefix.len == maxlen) that's exactly
+        // 2 spaces; shorter lines get (maxlen - prefix.len) extra spaces
+        // so descriptions line up.
+        const pad_count = maxlen - line.prefix.len + 2;
         try w.splatByteAll(' ', pad_count);
-        try w.writeAll(tail);
+        try w.writeAll(line.tail);
         try w.writeByte('\n');
     }
 
@@ -80,56 +89,58 @@ fn lessByName(_: void, a: *const Flag, b: *const Flag) bool {
     return std.mem.lessThan(u8, a.name, b.name);
 }
 
-/// Render one flag's full line: prefix portion ending with `\x00`, then
-/// usage + optional default + deprecation note.
-fn renderLine(allocator: std.mem.Allocator, flag: *const Flag) ![]u8 {
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
-    const w = &aw.writer;
+/// Render one flag into its alignment-column-split halves:
+///   prefix = "  -n, --name string" (or "      --name string" if no shorthand)
+///   tail   = "who to greet (default \"world\") (DEPRECATED: …)"
+fn renderLine(allocator: std.mem.Allocator, flag: *const Flag) !RenderedLine {
+    var prefix_aw: std.Io.Writer.Allocating = .init(allocator);
+    defer prefix_aw.deinit();
+    const pw = &prefix_aw.writer;
 
     if (flag.shorthand != 0 and flag.deprecated.len == 0) {
-        try w.print("  -{c}, --{s}", .{ flag.shorthand, flag.name });
+        try pw.print("  -{c}, --{s}", .{ flag.shorthand, flag.name });
     } else {
-        try w.print("      --{s}", .{flag.name});
+        try pw.print("      --{s}", .{flag.name});
     }
 
     const unquoted = unquoteUsage(flag);
     if (unquoted.varname.len > 0) {
-        try w.print(" {s}", .{unquoted.varname});
+        try pw.print(" {s}", .{unquoted.varname});
     }
 
     // pflag's NoOptDefVal hint — `--flag[=X]` for non-default sentinels.
     if (flag.no_opt_def_val.len > 0) {
         switch (flag.value_type) {
-            .string => try w.print("[=\"{s}\"]", .{flag.no_opt_def_val}),
+            .string => try pw.print("[=\"{s}\"]", .{flag.no_opt_def_val}),
             .bool => if (!std.mem.eql(u8, flag.no_opt_def_val, "true")) {
-                try w.print("[={s}]", .{flag.no_opt_def_val});
+                try pw.print("[={s}]", .{flag.no_opt_def_val});
             },
             .count => if (!std.mem.eql(u8, flag.no_opt_def_val, "+1")) {
-                try w.print("[={s}]", .{flag.no_opt_def_val});
+                try pw.print("[={s}]", .{flag.no_opt_def_val});
             },
-            else => try w.print("[={s}]", .{flag.no_opt_def_val}),
+            else => try pw.print("[={s}]", .{flag.no_opt_def_val}),
         }
     }
+    const prefix = try prefix_aw.toOwnedSlice();
+    errdefer allocator.free(prefix);
 
-    // Sentinel that flagUsages uses to find the alignment column.
-    try w.writeByte(0);
-
-    try w.writeAll(unquoted.usage);
-
+    var tail_aw: std.Io.Writer.Allocating = .init(allocator);
+    defer tail_aw.deinit();
+    const tw = &tail_aw.writer;
+    try tw.writeAll(unquoted.usage);
     if (!defaultIsZeroValue(flag)) {
         if (flag.value_type == .string) {
-            try w.print(" (default \"{s}\")", .{flag.default_value_string});
+            try tw.print(" (default \"{s}\")", .{flag.default_value_string});
         } else {
-            try w.print(" (default {s})", .{flag.default_value_string});
+            try tw.print(" (default {s})", .{flag.default_value_string});
         }
     }
-
     if (flag.deprecated.len > 0) {
-        try w.print(" (DEPRECATED: {s})", .{flag.deprecated});
+        try tw.print(" (DEPRECATED: {s})", .{flag.deprecated});
     }
+    const tail = try tail_aw.toOwnedSlice();
 
-    return aw.toOwnedSlice();
+    return .{ .prefix = prefix, .tail = tail };
 }
 
 pub const Unquoted = struct {
