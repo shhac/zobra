@@ -4,10 +4,14 @@ Status of record. Each phase has an explicit acceptance bar; we don't move forwa
 
 ## Status (as of last update)
 
-Phases 0 through 6 are **landed and pushed**. 135 tests pass under
-`zig build test`; format clean under `zig fmt --check .`. The example
-exe (`zig build run -- --help`, `zig build run -- greet alice -vv`)
-exercises the full pipeline end-to-end.
+Phases 0 through 6 plus the vipvot-parity push are **landed and pushed**.
+**215 tests** pass under `zig build test`; format clean. The example
+exe exercises the full pipeline end-to-end including the auto-print
+error path. zobra ships **34 flag types** (full pflag parity) plus
+the CustomFlag vtable for user-defined types.
+
+See [COMPARISON.md](../COMPARISON.md) for the cobra-vs-zobra feature
+matrix.
 
 | Phase | Status | Highlights |
 |---|---|---|

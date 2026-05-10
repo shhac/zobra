@@ -4,9 +4,13 @@ A zero-dependency Zig port of [spf13/cobra](https://github.com/spf13/cobra) — 
 
 > _zobra_ — `z` (Zig) + `(c)obra`. A different snake. Same library, ported.
 
-## Status: Phase 0 (scaffold)
+## Status: feature-parity-with-cobra-core (Phase 0–6 + vipvot-parity push complete)
 
-The repository currently contains the design docs, the project skeleton, and the shared cobra-reference oracle (copied verbatim from the sister TypeScript port [vipvot](https://github.com/shhac/vipvot)). The parser, flag registry, command runtime, and help renderer are not yet implemented. See [`design-docs/06-roadmap.md`](design-docs/06-roadmap.md) for the phased plan.
+215 tests, format clean. The library now ships **34 flag types** (full pflag parity), persistent flags + the five-stage hook chain, flag groups, args validators, byte-aligned help / usage rendering, `--help` / `-h` / `--version` auto-injection, the `help [path]` subcommand, suggestions on unknown flags / commands, `setOut` / `setErr` / `setHelpFunc` / `setUsageFunc`, the auto-print `Error: …` + usage path on parse errors (`executeAndPrint`), and the `CustomFlag` vtable for user-defined flag types.
+
+Doc generators (`zobra-doc`) and shell completion (`zobra-completion`) are explicit Phase 8/9 deferrals — substantial satellite modules each, scheduled for follow-up.
+
+See [`COMPARISON.md`](COMPARISON.md) for the full cobra-vs-zobra feature matrix and [`design-docs/06-roadmap.md`](design-docs/06-roadmap.md) for the phased status of record.
 
 ## Why
 
