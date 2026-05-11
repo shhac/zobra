@@ -4,13 +4,11 @@ A zero-dependency Zig port of [spf13/cobra](https://github.com/spf13/cobra) — 
 
 > _zobra_ — `z` (Zig) + `(c)obra`. A different snake. Same library, ported.
 
-## Status: v0.1.0 — cobra-feature-complete
+## Status
 
-286 tests (277 unit/integration + 9 E2E smoke), format clean. See [`CHANGELOG.md`](CHANGELOG.md) for v0.1.0 release notes. The library ships **34 flag types** (full pflag parity), persistent flags + the five-stage hook chain, flag groups, args validators, byte-aligned help / usage rendering, `--help` / `-h` / `--version` auto-injection, the `help [path]` subcommand, suggestions on unknown flags / commands, `setOut` / `setErr` / `setHelpFunc` / `setUsageFunc`, the auto-print `Error: …` + usage path on parse errors (`executeAndPrint`), and the `CustomFlag` vtable for user-defined flag types.
-
-**Doc generators** (`zobra-doc`) ship markdown / yaml / rest / man (+tree-walkers). **Shell completion** (`zobra-completion`) ships bash V2 / zsh / fish / powershell + the `__complete` runtime + the auto-installed `completion [shell]` subcommand.
-
-See [`COMPARISON.md`](COMPARISON.md) for the full cobra-vs-zobra feature matrix and [`design-docs/06-roadmap.md`](design-docs/06-roadmap.md) for the phased status of record.
+- **Per-feature support:** [`COMPARISON.md`](COMPARISON.md) — full cobra-vs-zobra matrix; what works, what diverges deliberately, what's deferred.
+- **Per-release notes:** [`CHANGELOG.md`](CHANGELOG.md).
+- **Roadmap / phased status:** [`design-docs/06-roadmap.md`](design-docs/06-roadmap.md).
 
 ## Why
 
@@ -52,55 +50,44 @@ Every load-bearing decision is written down. Read these before changing the corr
 - [`10-comptime-vs-runtime.md`](design-docs/10-comptime-vs-runtime.md) — when comptime, when runtime, why
 - [`11-public-surface.md`](design-docs/11-public-surface.md) — what's `pub`, semver policy, build.zig consumer wiring
 
-## Quick taste (Phase 1+ — not yet implemented)
-
-A glimpse of the target API. None of this builds today; it's the destination.
+## Quick taste
 
 ```zig
-const std = @import("std");
 const zobra = @import("zobra");
 
-pub fn main(init: std.process.Init) !void {
-    const arena = init.arena.allocator();
+var name: []const u8 = "world";
 
-    var name: []const u8 = "world";
-    var verbose: i32 = 0;
-
-    const root = try zobra.Command.init(arena, .{
-        .use = "myapp",
-        .short = "my CLI",
-        .run_e = greet,
-    });
-    defer root.deinit();
-
-    try root.persistentFlags().stringVarP(&name, "name", "n", "world", "who to greet");
-    try root.persistentFlags().countVarP(&verbose, "verbose", "v", "verbose level");
-    try root.markFlagRequired("name");
-
-    try root.execute(arena, try init.minimal.args.toSlice(arena));
+fn greet(cmd: *zobra.Command, _: []const []const u8) anyerror!void {
+    const w = cmd.outWriter() orelse return;
+    try w.print("hello, {s}\n", .{name});
 }
 
-fn greet(cmd: *zobra.Command, args: []const []const u8) anyerror!void {
-    _ = cmd; _ = args;
-    std.debug.print("hello, world\n", .{});
-}
+// inside main():
+const root = try zobra.Command.init(arena, .{ .use = "tool", .run_e = greet });
+defer root.deinit();
+try root.persistentFlags().stringVarP(&name, "name", 'n', "world", "who to greet");
+root.setOut(stdout);
+try root.executeAndPrint(argv);
 ```
+
+The full runnable demo (with subcommands, the `-vv` count flag, an args validator, and explicit-IO plumbing) is in [`examples/hello/main.zig`](examples/hello/main.zig) — invoke via `zig build run -- greet --name=alice`. Side-by-side cobra↔zobra ports and porting recipes are in [`examples/`](examples/README.md) and [`COMPARISON.md`](COMPARISON.md).
 
 ## Development
 
 ```bash
-zig build              # build everything
-zig build run          # run the example
-zig build test         # full test suite
-zig fmt --check .      # format check
+zig build                                    # build everything
+zig build run -- greet                       # run the example
+zig build test                               # unit + integration suite (277 tests)
+zig build test-e2e                           # E2E smoke tests (spawns the demo binary)
+zig fmt --check src test build.zig examples  # format check
 ```
 
 To regenerate oracle fixtures (requires Go and a sibling vipvot checkout):
 
 ```bash
-scripts/oracle-sync.sh    # pull oracle source + fixtures from vipvot
-scripts/oracle-build.sh   # compile oracle/bin/cobra-oracle
-scripts/oracle-capture.sh # capture fixtures (Phase 1+)
+scripts/oracle-sync.sh     # pull oracle source + fixtures from vipvot
+scripts/oracle-build.sh    # compile oracle/bin/cobra-oracle
+scripts/oracle-capture.sh  # run the binary against the matrix → update fixtures
 ```
 
 ## License
