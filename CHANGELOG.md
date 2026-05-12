@@ -2,6 +2,18 @@
 
 All notable changes to zobra are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-05-11
+
+### Added
+- `NOTICE` file at repo root + `licenses/cobra-LICENSE-2.0.txt` — Apache-2.0 attribution for the verbatim cobra/pflag strings zobra borrows (parse-error wording, flag-group violation wording, the `Long` text of the auto-injected `help` and `completion` subcommands). Required to ship with every distribution per Apache-2.0 §4(d).
+- `build.zig.zon`'s `paths` now includes `NOTICE` and `licenses/` so they're part of what `zig fetch` resolves.
+
+### Fixed
+- **Compliance**: v0.1.0's release tarball did not contain the NOTICE / Apache-2.0 text. v0.1.1 is the first release tarball that is Apache-2.0-compliant for the derivative strings. **Consumers on v0.1.0 should upgrade to v0.1.1.** No behavioural difference.
+
+### Notes
+- v0.1.0 will remain on GitHub Releases for traceability but is marked yank-recommended in this entry. We did not force-retag because that would break the `zig fetch` hash contract for anyone who already pulled v0.1.0.
+
 ## [0.1.0] - 2026-05-11
 
 First public release. Cobra parity is feature-complete for the core, doc generators, and shell completion. **Zig 0.16+ only.**

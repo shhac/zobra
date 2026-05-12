@@ -19,7 +19,7 @@ The deliverable is a Zig module. Other projects pull it in via `build.zig.zon`:
 ```zig
 .dependencies = .{
     .zobra = .{
-        .url = "https://github.com/shhac/zobra/archive/refs/tags/v0.1.0.tar.gz",
+        .url = "https://github.com/shhac/zobra/archive/refs/tags/v0.1.1.tar.gz",
         // .hash filled in by `zig fetch --save`
     },
 },
