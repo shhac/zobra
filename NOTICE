@@ -1,0 +1,72 @@
+zobra
+Copyright (c) 2026 Paul Somers
+
+This product includes software developed by third parties:
+
+────────────────────────────────────────────────────────────────────────
+1. cobra (https://github.com/spf13/cobra) and pflag
+   (https://github.com/spf13/pflag)
+   Copyright spf13 contributors
+   Licensed under the Apache License, Version 2.0
+   Full license text: licenses/cobra-LICENSE-2.0.txt
+
+   zobra is a Zig port of cobra. APIs, structural design, hook
+   ordering, and behaviour are emulated; ideas and APIs are not
+   copyrightable and need no attribution. The following limited
+   passages are verbatim or near-verbatim copies of cobra/pflag
+   strings and are derivative under Apache 2.0:
+
+   (a) pflag-byte-identical error wording in the parse / coerce path.
+       Format strings:
+         "invalid argument \"%s\" for \"--%s\" flag: %s"
+         "invalid argument \"%s\" for \"-%c, --%s\" flag: %s"
+         "unknown flag: --%s"
+         "unknown shorthand flag: \"%s\" in -%s"
+         "flag needs an argument: --%s"
+         "flag needs an argument: \"%s\" in -%s"
+         "bad flag syntax: %s"
+       The pflag-shaped strconv function names also appear verbatim
+       as `func` arguments routed through the error renderer:
+         "ParseBool", "ParseInt", "ParseUint", "ParseFloat", "Atoi"
+       Sites in zobra:
+         src/core/flag/bind.zig (failCoerce / failCoerceWithRendered)
+         src/core/command/parse_diag.zig (render)
+
+   (b) cobra-byte-identical flag-group violation wording. Format
+       strings:
+         "if any flags in the group [%s] are set they must all be
+          set; missing [%s]"
+         "at least one of the flags in the group [%s] is required"
+         "if any flags in the group [%s] are set none of the others
+          can be; [%s] were all set"
+       Sites in zobra:
+         src/core/command/groups.zig
+
+   (c) Verbatim Long-text wording of the auto-injected `help` and
+       `completion` subcommands, mirroring cobra's
+       `AddDefaultHelpCmd` and `initDefaultCompletionCmd`:
+         "Help about any command"
+         "Help provides help for any command in the application."
+         "Generate shell completion scripts"
+         "Generate shell completion scripts. To load completions: …"
+       Sites in zobra:
+         src/core/command/defaults.zig
+         src/completion/runtime.zig
+
+   What is NOT derivative of cobra:
+   - The shell-completion script templates in src/completion/
+     {bash,zsh,fish,powershell}.zig. These are zobra-original
+     minimum-viable scripts that follow cobra's wire protocol but do
+     not vendor cobra's bundled completion scripts. If a future
+     release vendors cobra's scripts byte-for-byte, this notice will
+     be extended and a strip-on-render banner mechanism added (cf.
+     vipvot's approach in its NOTICE).
+   - The `oracle/` directory contains a Go program built against
+     spf13/cobra and spf13/pflag for differential testing. It is a
+     build-time test artefact, not part of zobra's distributed
+     source (excluded from build.zig.zon's `paths`).
+────────────────────────────────────────────────────────────────────────
+
+zobra's own source code (everything outside the verbatim passages
+named above) is licensed under the MIT License; see the `LICENSE`
+file at the repository root.

@@ -92,9 +92,9 @@ scripts/oracle-capture.sh  # run the binary against the matrix → update fixtur
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). zobra borrows a small number of byte-identical strings from cobra/pflag (parse-error wording, flag-group violation wording, the `Long` text of the auto-injected `help` and `completion` subcommands); those passages are derivative under Apache-2.0 and attributed in [NOTICE](NOTICE) (full Apache-2.0 text at [`licenses/cobra-LICENSE-2.0.txt`](licenses/cobra-LICENSE-2.0.txt)).
 
-The cobra reference binary in `oracle/` is built against [spf13/cobra](https://github.com/spf13/cobra) and [spf13/pflag](https://github.com/spf13/pflag), which are Apache-2.0 licensed. The oracle binary is a build-time test artefact, not a published part of zobra.
+The cobra reference binary in `oracle/` is built against [spf13/cobra](https://github.com/spf13/cobra) and [spf13/pflag](https://github.com/spf13/pflag) for differential testing. It is a build-time test artefact, not a published part of zobra (excluded from `build.zig.zon`'s `paths`).
 
 ## Sister project
 
